@@ -1,0 +1,56 @@
+name: CLA check
+
+# Enforces the in-repo CLA sign-off: a pull request can only merge if its author
+# has agreed to the Contributor License Agreement by adding their @handle to
+# CONTRIBUTORS.md (see CONTRIBUTING.md). No third-party CLA service is used — this
+# runs entirely in the project's own GitHub Actions.
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      # Checks out the PR merge ref, so a first-time contributor who adds their
+      # signature line in this same PR is recognized.
+      - name: Check out pull request
+        uses: actions/checkout@v4
+
+      - name: Verify the author has signed the CLA
+        shell: bash
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          # Maintainers and trusted bots do not sign the CLA:
+          #  - the maintainer is the recipient of the grant, not a signatory;
+          #  - dependency/automation bots author no copyrightable contribution.
+          # A case match avoids any dependence on shell word-splitting.
+          case "$PR_AUTHOR" in
+            gnuphie|"dependabot[bot]"|"github-actions[bot]")
+              echo "Author '$PR_AUTHOR' is allowlisted (maintainer/bot); CLA check skipped."
+              exit 0
+              ;;
+          esac
+
+          if [ ! -f CONTRIBUTORS.md ]; then
+            echo "::error::CONTRIBUTORS.md is missing; cannot verify CLA agreement."
+            exit 1
+          fi
+
+          # The ledger records each contributor's @handle in a "(@handle)" token.
+          if grep -qiE "\(@${PR_AUTHOR}\)" CONTRIBUTORS.md; then
+            echo "Author '@$PR_AUTHOR' found in CONTRIBUTORS.md — CLA agreement on record."
+            exit 0
+          fi
+
+          echo "::error::@$PR_AUTHOR has not signed the nibdex CLA. Add your"
+          echo "::error::agreement line to CONTRIBUTORS.md in this pull request."
+          echo "::error::See CONTRIBUTING.md for the exact format."
+          exit 1

@@ -1,0 +1,67 @@
+# cargo-deny configuration — supply-chain gate for nibdex.
+#
+# Run: `cargo deny check` (licenses + advisories + bans + sources).
+# Realizes DESIGN.md §13.1 gate 5 ("confirm every transitive dep is a
+# permissive OSI/FSF license; no copyleft surprises") + §10 O5 (rmcp maturity).
+#
+# Last reviewed: 2026-07-11 (cargo-deny 0.20.2).
+
+[graph]
+# Evaluate every target so a platform-specific dep can't smuggle in a
+# disallowed license or advisory that the host-only view would miss.
+all-features = true
+
+# ---------------------------------------------------------------------------
+[licenses]
+# Every license below is permissive (OSI-approved and/or FSF Free). No
+# copyleft (GPL/LGPL/AGPL) or weak-copyleft (MPL) license is allowed — those
+# appear only inside OR-expressions here and are satisfied by a permissive
+# alternative (e.g. r-efi's "MIT OR Apache-2.0 OR LGPL-2.1-or-later" resolves
+# to MIT/Apache). Confirmed against the full tree on 2026-07-11.
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # wasm/llvm-adjacent crates
+    "BSD-2-Clause",
+    "BSD-3-Clause",                   # e.g. subtle
+    "ISC",                            # e.g. ring (Apache-2.0 AND ISC), rustls webpki
+    "Zlib",
+    "Unicode-3.0",                    # the ICU / zerovec family (18 crates)
+    "CC0-1.0",                        # notify — public-domain dedication
+]
+
+# Per-crate exceptions: a license we accept for ONE named crate rather than
+# globally, so it can't silently widen to the rest of the tree.
+[[licenses.exceptions]]
+# Mozilla's bundled root-certificate set. CDLA-Permissive-2.0 is a permissive
+# data license; accepting it for this one data crate, not tree-wide.
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+# ---------------------------------------------------------------------------
+[advisories]
+# RustSec advisory DB. cargo-deny evaluates the *resolved build graph*, so it
+# sees only crates actually compiled into nibdex — and it reports NO advisories
+# there. The one accepted advisory (RUSTSEC-2023-0071 in `rsa`) is a lockfile-
+# only phantom pulled by the never-compiled sqlx-mysql driver; cargo-audit
+# scans the whole Cargo.lock and flags it, so its ignore + full rationale live
+# in .cargo/audit.toml. Deliberately NOT mirrored here: adding it would trip
+# cargo-deny's "advisory-not-detected" warning precisely because the crate is
+# absent from the real graph.
+ignore = []
+
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate versions of a crate are common and harmless in a large tree; warn
+# rather than fail. Tighten to "deny" with skips later if bloat matters.
+multiple-versions = "warn"
+wildcards = "warn"
+
+# ---------------------------------------------------------------------------
+[sources]
+# All dependencies must come from the crates.io registry — no unvetted git or
+# alternative-registry sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

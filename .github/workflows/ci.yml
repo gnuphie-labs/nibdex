@@ -1,0 +1,60 @@
+name: CI
+
+# Build, test, and lint on every push to main and every pull request.
+# The quality gate is clippy with warnings denied. nibdex is intentionally NOT
+# maintained cargo-fmt-clean (its style is hand-wrapped to width), so there is
+# deliberately no `cargo fmt --check` step here — see CONTRIBUTING.md.
+# Runs entirely in the project's own GitHub Actions; no third-party CI service.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+# Newer pushes to the same ref cancel older still-running jobs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # GitHub runners ship rustup; pin to stable + the clippy component.
+      # edition = "2024" requires Rust >= 1.85 (stable satisfies this).
+      - name: Install the stable toolchain with clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version && cargo --version && cargo clippy --version
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Build (all targets)
+        run: cargo build --all-targets --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --all-targets --locked -- --deny warnings

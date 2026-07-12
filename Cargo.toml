@@ -1,0 +1,75 @@
+[package]
+name = "nibdex"
+version = "0.1.0-rc.0"
+edition = "2024"
+description = "nibdex — derived MCP index over a workspace's source code, git commits, design docs, memory, and AI session history"
+license = "MIT"
+repository = "https://github.com/gnuphie-labs/nibdex"
+readme = "README.md"
+keywords = ["mcp", "search", "index", "fts5", "local-first"]
+categories = ["development-tools", "command-line-utilities", "text-processing"]
+# MSRV floor: edition 2024 (>=1.85) + let-chains (stabilized 1.88). Derived from
+# the language features in use, not pinned by a CI job on that exact toolchain.
+rust-version = "1.88"
+# Never ship internal maintainer docs in the published crate tarball — they carry
+# development/host context (the "Do NOT publish" set). Defense-in-depth so
+# `cargo publish` is safe from any checkout, not only the clean public tree.
+exclude = [
+    "CLAUDE.md",
+    "docs/IMPLEMENTATION_TRACKER.md",
+    "docs/IDEAS_SCRATCH.md",
+    "docs/PUBLICATION_CHECKLIST.md",
+    "docs/GIT2_MIGRATION_PLAN.md",
+    "docs/SESSION_SCOPE_DESIGN.md",
+    "docs/D1_SCOPE.md",
+    "dogfood/",
+    "baselines/",
+]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+memory-stats = "1"
+regex = "1"
+rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "io-std", "signal"] }
+tokio-util = "0.7"
+toml = "0.8"
+walkdir = "2"
+
+# Per-target dependency linkage — keeps the macOS build byte-for-byte unchanged
+# while unblocking Linux/Windows.
+#
+# notify / notify-debouncer-mini: macOS has two backends, so it needs the
+# explicit `macos_fsevent` feature; the Windows (ReadDirectoryChangesW) and
+# Linux (inotify) backends are gated by `target_os` *inside* notify and pull in
+# their native deps automatically — no backend feature required.
+#
+# git2: non-Windows links a system libgit2 (unchanged). Windows vendors + builds
+# libgit2 from source (`vendored-libgit2`) so end users there need no separate
+# libgit2 install — requires CMake + MSVC at build time (see WINDOWS_BUILD.md).
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+notify-debouncer-mini = { version = "0.7", default-features = false, features = ["macos_fsevent"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify = { version = "8", default-features = false }
+notify-debouncer-mini = { version = "0.7", default-features = false }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+git2 = { version = "0.21", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

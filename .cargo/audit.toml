@@ -1,0 +1,32 @@
+# cargo-audit configuration — accepted advisories with rationale.
+#
+# Auto-discovered by `cargo audit` at `.cargo/audit.toml`. Every entry in
+# `ignore` below is an advisory we have consciously accepted, each with the
+# reasoning recorded inline and a review date. Re-review at each dependency
+# bump and before any public release (DESIGN.md §13.1 gate 5).
+#
+# Last reviewed: 2026-07-11
+#
+# Clean advisories fixed by lockfile bump on 2026-07-11 (NOT ignored — genuinely
+# resolved): RUSTSEC-2026-0185 (quinn-proto -> 0.11.16), RUSTSEC-2026-0190
+# (anyhow -> 1.0.103).
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa` 0.9.x.
+    #
+    # Reachability: `rsa` is pulled ONLY by `sqlx-mysql`, which sqlx drags in
+    # transitively via its `macros` feature even though nibdex compiles sqlx with
+    # `default-features = false, features = ["sqlite", ...]` and never enables a
+    # MySQL driver. nibdex opens exactly one database: a local SQLite file. The
+    # vulnerable code path is MySQL's RSA-based auth handshake, which nibdex never
+    # executes — there is no MySQL connection, no RSA key exchange, in this binary.
+    #
+    # Fix status: no patched `rsa` release exists (upstream has no constant-time
+    # fix as of this review). There is nothing to upgrade to; the only true removal
+    # would be dropping sqlx's `macros` feature, which nibdex relies on.
+    #
+    # Accepted 2026-07-11. Re-check whether a fixed `rsa` has shipped, or whether
+    # sqlx has severed the sqlx-mysql dependency, at the next audit.
+    "RUSTSEC-2023-0071",
+]

@@ -1,0 +1,125 @@
+# nibdex §8.4 Layer 2 calibration model — v0.1
+#
+# Per-tool counterfactual estimates seeded from the maintainer's dogfood
+# corpus shape (a multi-repo developer workspace) as of 2026-05-27. Users with
+# differently-shaped workspaces are expected to re-tune; this file is the seed,
+# not the contract.
+#
+# Honesty framing (§11): every event carries `calibration_confidence =
+# "estimated"`. These numbers are p50/p95 anchors derived from §2.4 M1/M2
+# anecdotes + corpus shape, not measured from instrumented Claude Code
+# sessions. Phase 2 Layer 2-B can promote individual entries to "measured"
+# by sampling real counterfactual sessions.
+#
+# Schema policy: the [model] block + [tools.<name>] blocks are the public
+# contract. Bumping `version` is a USER-FACING config rev — historical
+# `cost_ledger_events` rows keep their per-row stamp, so re-tuning here
+# does not retroactively change past savings figures.
+
+[model]
+version = "v0.2-2026-06-05"
+generated_from = "maintainer dogfood corpus 2026-05-27 + DESIGN §2.4 M1/M2 anecdotes; v0.2 savings-model knobs tuned from a 2026-06-05 workspace export"
+
+# Anthropic input-token pricing for the default Claude Code model.
+# Sonnet 4.6 input rate as of 2026-05-27. Opus 4.7 input rate is ~5× higher
+# and Haiku 4.5 is ~10× lower — users on those models see proportionally
+# scaled dollar figures. Multi-model rate selection is Phase 2.
+input_rate_usd_per_mtok = 3.0
+
+# ---- v0.2 savings-model knobs (D-8.11) -------------------------------------
+# The per-tool counterfactual below is a flat *average-path* anchor. The first
+# real work-seat export (2026-06-05) showed `saved = anchor − result` mis-scores
+# two ways: a zero-result query banked the full anchor ("found nothing, saved
+# 60k"), and a legitimately large result (a 61k-token design-doc section) scored
+# a big *loss* — but a retrieval can't honestly cost more than reading the same
+# content by hand. These knobs correct both; tune them from your own exports.
+#
+#   effective_counterfactual =
+#       0                                                if admin tool (check)
+#       result + zero_match_savings_tokens               if nothing returned
+#       max(anchor, result*recovery_factor + overhead)   otherwise
+#   tokens_saved = effective_counterfactual − result     (always reconciles)
+
+# Fixed tokens the by-hand baseline spends *locating* an answer (grep + open
+# files) on top of reading it. Floors a successful retrieval's credited saving.
+search_overhead_tokens = 2000
+# By-hand baseline reads at least `result × this` (a section lives in a bigger
+# doc you read around to find). 1.0 = no inflation; conservative seed.
+result_recovery_factor = 1.0
+# A call that returned nothing saved nothing. Set negative to charge a wasted
+# call as a small honest cost.
+zero_match_savings_tokens = 0
+
+# ---- Phase-2 time-saved model knobs (record-then-rescore; INERT today) ------
+# The live emit path scores only TOKEN savings. These two knobs power an offline
+# TIME saving in `nibdex rescore` — the value of nibdex *locating* data vs the
+# AI searching for it at need. They consume the per-call `returned_full_tokens`
+# now being recorded (Phase 1). Left at 0.0 = no time credit until the grounded
+# model is turned on; tune from your own exports then.
+#   time_saved_ms =  grounded_counterfactual_ktok * ai_read_ms_per_ktok      (read)
+#                  + returned_hits * roundtrip_ms_per_call                    (round-trips)
+#                  − wall_ms                                                  (measured)
+# ms the by-hand baseline spends reading per 1k counterfactual tokens.
+ai_read_ms_per_ktok = 0.0
+# ms credited per eliminated grep/open round-trip the by-hand search would cost.
+roundtrip_ms_per_call = 0.0
+
+# Locate-a-session counterfactual: Claude reads CLAUDE.md fully (~152 KB)
+# + greps memory dir to find the entry. §2.4 M1 baseline.
+[tools.find_session]
+counterfactual_tokens_p50 = 60000
+counterfactual_tokens_p95 = 85000
+counterfactual_wall_ms_p50 = 8500
+
+# Memory lookup: MEMORY.md (~25 KB) + grep across ~50 topic files.
+[tools.find_memory]
+counterfactual_tokens_p50 = 14000
+counterfactual_tokens_p95 = 28000
+counterfactual_wall_ms_p50 = 4500
+
+# Design-doc lookup: 5 candidate docs at ~12 KB each (avg path through
+# the 98-doc design corpus).
+[tools.find_design_doc]
+counterfactual_tokens_p50 = 18000
+counterfactual_tokens_p95 = 45000
+counterfactual_wall_ms_p50 = 6500
+
+# Recent-sessions skim: Claude reads CLAUDE.md tail + recent session
+# history (~150 KB at 3 KB/Ktok). Session-orientation reset.
+[tools.recent_sessions]
+counterfactual_tokens_p50 = 50000
+counterfactual_tokens_p95 = 65000
+counterfactual_wall_ms_p50 = 6500
+
+# Recent-commits skim: `git log --oneline -50` + read body of top hits.
+[tools.recent_commits]
+counterfactual_tokens_p50 = 5500
+counterfactual_tokens_p95 = 14000
+counterfactual_wall_ms_p50 = 3500
+
+# Commit lookup: `git log --grep <term>` + read 3-5 commit bodies.
+[tools.find_commit]
+counterfactual_tokens_p50 = 9500
+counterfactual_tokens_p95 = 22000
+counterfactual_wall_ms_p50 = 5500
+
+# Code search WITH provenance (D1a). Standalone grep is cheap, but the value
+# nibdex collapses is the provenance cascade: grep -> open & read
+# the matching source regions -> `git blame`/`git log` to find the introducing
+# commit -> hunt the design/session that fed it. Anchored between find_commit
+# and find_design_doc; the v0.2 size-floor lifts it when results are large and
+# the match-gate zeroes empty results. PROVISIONAL — tune from a real export
+# (the self-tuning lane), since D1a is the first corpus with no field data yet.
+[tools.find_code]
+counterfactual_tokens_p50 = 12000
+counterfactual_tokens_p95 = 30000
+counterfactual_wall_ms_p50 = 6000
+
+# `check()` is an admin inspection tool, not an AI substitution path.
+# Explicit zero counterfactual prevents fake-savings inflation: there is
+# no "what would Claude have done without nibdex" answer because nothing
+# else exposes daemon health. D-8.2 invariant — closed by G8.6 smoke gate.
+[tools.check]
+counterfactual_tokens_p50 = 0
+counterfactual_tokens_p95 = 0
+counterfactual_wall_ms_p50 = 0

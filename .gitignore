@@ -1,0 +1,49 @@
+/target
+
+# SQLite (FTS5 index + WAL/SHM sidecars)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Metrics sink output (§5.5)
+*.jsonl
+
+# Day 10 self-dogfood — daemon live-state (PID + stderr/stdout log)
+# (cold_index_*.log IS committed as one-shot evidence; daemon.log mutates)
+# Glob covers per-machine suffixed variants like daemon-home.log
+dogfood/daemon*.pid
+dogfood/daemon*.log
+
+# Third-party reference docs (clipped articles, vendor PDFs) — local-only, never commit
+# (publication-bound repo + copyrighted content risk)
+docs/*.pdf
+
+# Secrets — NEVER commit (defense in depth)
+.env
+.env.*
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.gpg
+*.age
+*.asc
+**/secrets/
+**/.secrets/
+*.sops.yaml
+.aws/
+.gcloud/
+.kube/config
+id_rsa
+id_ed25519
+**/id_rsa*
+**/id_ed25519*
+
+# OS
+.DS_Store
+
+# Day 10 self-dogfood — local metrics-export candidates (IP-scrubbed, hand-shared; not tracked)
+dogfood/nibdex-metrics-export-*.json
