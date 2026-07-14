@@ -1,8 +1,8 @@
 # Examples
 
-This is **real output from real queries** — captured by driving the MCP server over stdio and snapshotting the responses. Nothing here is estimated, hand-constructed, or redacted.
+Q1–Q4 and `check()` are **real output from real queries** — captured by driving the MCP server over stdio and snapshotting the responses; nothing there is estimated, hand-constructed, or redacted. Q5 (`find_session`) and Q6 (IP domains) are the exceptions and are **labeled as illustrative**: their corpora are your own machine's transcripts and directory layout, so they can't be reproduced from a clone — the shapes shown are representative, not a captured run.
 
-To keep every example reproducible, these queries were run against **nibdex's own repository** as the corpus (`nibdex index --workspace path/to/nibdex`). Clone nibdex, index it, and you'll see the same shapes against the same code — the ranks and line numbers will track whatever commit you're on. (Absolute paths below use `~/…` in place of a real home directory; the tool returns your actual absolute path.)
+To keep the reproducible examples reproducible, those queries were run against **nibdex's own repository** as the corpus (`nibdex index --workspace path/to/nibdex`). Clone nibdex, index it, and you'll see the same shapes against the same code — the ranks and line numbers will track whatever commit you're on. (Absolute paths below use `~/…` in place of a real home directory; the tool returns your actual absolute path.)
 
 The corpus these queries ran against — nibdex indexing itself:
 
@@ -12,10 +12,10 @@ The corpus these queries ran against — nibdex indexing itself:
 | `commit_entries` (1 repo) | 179 |
 | `design_doc_sections` (18 docs) | 342 |
 | `search_index` (FTS5) total | 1,005 |
-| `session_entries` | 0 |
+| `session_edges` | 0 |
 | `memory_entries` | 0 |
 
-`session_entries` and `memory_entries` are **0 here on purpose**, and it's worth being honest about why: nibdex's own `CLAUDE.md` isn't written in the session-history format `find_session` parses (see the README), and there's no memory directory inside the repo. On a workspace that *does* have those, both corpora populate — but the three that carry a project's substance (`find_code`, `find_commit`, `find_design_doc`) work on any git repo with no setup. So the tour leads with `find_code`.
+`session_edges` and `memory_entries` are **0 here on purpose**: the session→code map is built from *your* Claude Code transcripts via a separate `nibdex index-sessions` step (not from the cloned repo), and there's no memory directory inside the repo. On your own workspace both populate — but the three corpora that carry a project's substance (`find_code`, `find_commit`, `find_design_doc`) work on any git repo with no setup, which is why the tour leads with `find_code`.
 
 ---
 
@@ -144,17 +144,70 @@ Two honest notes on this output:
 
 ---
 
-## Q5 — `find_session` on a repo without the format: an honest empty
+## Q5 — `find_session`: the session→code map *(illustrative — your-machine-specific)*
+
+`find_session` and `recent_sessions` are the one pair that can't be reproduced from a clone. Their corpus is the **session→code map** — the `Edit`/`Write` actions nibdex recovers from *your* Claude Code transcripts (`~/.claude/projects/`) via a separate `nibdex index-sessions` step. Against a fresh clone with no session indexing, the call is an honest empty (never an error — the "empty is not error" contract holds, so retry-wrapping clients stay well-behaved):
 
 ```jsonc
-// Call
-{ "tool": "find_session", "arguments": { "query": "anything", "limit": 3 } }
-
-// Response
 { "tool": "find_session", "total_matched": 0, "returned": 0, "results": [] }
 ```
 
-This is not a failure — it's the honest result of pointing `find_session` at a repo whose `CLAUDE.md` isn't in the session-history format it parses (nibdex's own repo, here). An empty envelope comes back, never an error (per the "empty is not error" contract), so a client that wraps calls in retry-on-failure logic stays well-behaved. On a workspace with a session-formatted `CLAUDE.md`, the same call returns ranked entries with `files_touched` / `todos_mentioned` / `decisions_made`. A transcript-based session index that doesn't depend on the format is the Phase-1b plan — see the roadmap.
+Once you've indexed your transcripts (`nibdex index-sessions --all-slugs --db nibdex.db`, or `--slug <encoded-dir>` to restrict to one — the slug is the encoded project-dir name like `-Users-you-workspace`; `ls ~/.claude/projects` shows yours), the same query returns the actual edits, matched by their *rationale*. The shape a populated call returns (illustrative — yours reflects your own history):
+
+```jsonc
+// Call
+{ "tool": "find_session", "arguments": { "query": "loopback enforcement", "limit": 1 } }
+
+// Response (shape)
+{
+  "tool": "find_session",
+  "total_matched": 4,
+  "returned": 1,
+  "results": [
+    {
+      "session_id": "…",
+      "tool": "Edit",
+      "file_path": "src/http_server.rs",
+      "edited_at_iso": "2026-06-05T18:22:10Z",
+      "rationale": "Refuse a non-loopback bind at startup rather than trusting config — the authorization model is filesystem access, so a public bind would be a footgun.",
+      "commit_hash": "94a7901",
+      "commit_summary": "loopback-only MCP transport",
+      "rank": -3.11
+    }
+  ]
+}
+```
+
+The match is on the rationale + path, so a *concept* query ("loopback enforcement") surfaces the edit by its reasoning, not just its filename — and each hit carries the commit that captured it. `recent_sessions` returns the same record shape, one representative row per session, most-recently-active first.
+
+---
+
+## Q6 — Separating IP domains: two clients, two databases *(illustrative)*
+
+If more than one client's or employer's code lives in one workspace, label the top-level subdirectories and build one database per domain. Given a `.nibdex-domains.toml` at the workspace root:
+
+```toml
+[domains]
+personal = ["my-app", "my-lib"]
+client-a = ["acme-api", "acme-web"]
+```
+
+```bash
+nibdex index          --domain client-a --workspace ~/ws --db ~/client-a.db
+nibdex index-sessions --domain client-a --all-slugs --workspace ~/ws --db ~/client-a.db
+```
+
+The session pass reports what it routed and what it held back (numbers illustrative):
+
+```
+Indexed 1,204 write-edge(s) ... from 6 session(s)
+  domain [client-a]: 2,310 edge(s) dropped (foreign target), 41 rationale(s) withheld (cross-domain session)
+```
+
+- **dropped (foreign target)** — edits under `my-app`/`my-lib` (or unlabeled dirs), correctly left out of `client-a.db`.
+- **withheld** — edits kept, but with their rationale withheld because the session had also touched a non-`client-a` tree (the ratchet — see [`IP_DOMAINS.md`](IP_DOMAINS.md)).
+
+`nibdex mcp --db ~/client-a.db` then answers only from client-a's content: a `find_code` or `find_session` here can't surface `my-app` code, commits, or reasoning, because none of it is in this database file — not filtered out, structurally absent. The full mechanism and honest limits are in [`IP_DOMAINS.md`](IP_DOMAINS.md).
 
 ---
 
@@ -175,9 +228,10 @@ This is not a failure — it's the honest result of pointing `find_session` at a
     "indexed_repos": 1,
     "memory_entries": 0,
     "session_entries": 0,
+    "session_edges": 0,
     "search_index_total": 1005
   },
-  "orphans": { "source_chunks": 0, "design_doc_sections": 0, "memory_entries": 0, "session_entries": 0, "indexed_repos": 0 },
+  "orphans": { "design_doc_sections": 0, "memory_entries": 0, "session_entries": 0, "indexed_repos": 0 },
   "perf_p50_ms": { "tool.find_code": 3, "tool.find_commit": 2, "tool.find_design_doc": 4, "tool.find_session": 2, "tool.recent_commits": 1 },
   "shallow_repos": [],
   "build": { "git_sha": "…", "crate_version": "0.1.0-rc.0" }

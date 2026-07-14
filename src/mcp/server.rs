@@ -58,18 +58,21 @@ impl NibdexServer {
 
 #[tool_router(router = tool_router)]
 impl NibdexServer {
-    /// Recent session-history entries by recency, optionally narrowed by FTS5 filter.
+    /// Recently-active sessions by recency, optionally narrowed by FTS5 filter.
     #[tool(
         name = "recent_sessions",
-        description = "Recent session-history entries from CLAUDE.md, ordered by entry_date DESC. \
-                       `filter` is an OPTIONAL FTS5 MATCH expression against entry body (raw FTS5 syntax, not natural language). \
-                       `days` defaults to 30. `limit` defaults to 10, max 50. \
-                       Returns envelope with results array + total_matched + returned + tool."
+        description = "Recently-active sessions from the session→code map — one representative row \
+                       per session (its most-recent Edit/Write, with the file, rationale, and \
+                       capturing commit), ordered by that latest edit DESC. \
+                       `filter` is an OPTIONAL FTS5 MATCH expression against the edit rationale + path \
+                       (raw FTS5 syntax, not natural language) that narrows which sessions appear. \
+                       `days` defaults to 30 (window on edit time). `limit` defaults to 10, max 50. \
+                       Returns envelope with results array + total_matched (distinct sessions) + returned + tool."
     )]
     pub async fn recent_sessions(
         &self,
         params: Parameters<RecentSessionsRequest>,
-    ) -> Result<Json<ToolEnvelope<SessionResult>>, String> {
+    ) -> Result<Json<ToolEnvelope<SessionEdgeResult>>, String> {
         let req = params.0;
         let op = Op::start("tool.recent_sessions");
         let call_start = Instant::now();
@@ -129,18 +132,23 @@ impl NibdexServer {
         }
     }
 
-    /// Session-history entries ranked by FTS5 relevance.
+    /// Session→code edits (file + rationale + capturing commit) ranked by FTS5 relevance.
     #[tool(
         name = "find_session",
-        description = "Search session-history entries from CLAUDE.md by FTS5 relevance. \
-                       `query` is a REQUIRED FTS5 MATCH expression (raw FTS5 syntax, not natural language). \
-                       Results ordered by bm25 rank ASC (best first), then session_number DESC. \
-                       `limit` defaults to 10, max 50."
+        description = "Search the session→code map by FTS5 relevance: past Edit/Write actions \
+                       recovered from Claude Code transcripts, each returning the file it touched, \
+                       the assistant rationale for the edit, and the commit that captured it (when \
+                       bound). Matches on the rationale + path, so a CONCEPT query (\"loopback \
+                       enforcement\") surfaces edits by their reasoning, not just their filename. \
+                       `query` is a REQUIRED FTS5 MATCH expression (raw FTS5 syntax, not natural \
+                       language); a multi-term query that AND-matches nothing is auto-retried \
+                       OR-broadened. Results ordered by bm25 rank ASC (best first), then most \
+                       recent edit. `limit` defaults to 10, max 50."
     )]
     pub async fn find_session(
         &self,
         params: Parameters<FindSessionRequest>,
-    ) -> Result<Json<ToolEnvelope<SessionResult>>, String> {
+    ) -> Result<Json<ToolEnvelope<SessionEdgeResult>>, String> {
         let req = params.0;
         let op = Op::start("tool.find_session");
         let call_start = Instant::now();

@@ -8,6 +8,7 @@ mod cli;
 mod cost_ledger;
 mod db;
 mod diff_index;
+mod domains;
 mod extractor;
 mod hash;
 mod http_server;
@@ -42,6 +43,7 @@ async fn main() -> Result<()> {
             db,
             git_max_depth,
             include_nested_repos,
+            domain,
             max_commits_per_repo,
         } => {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
@@ -60,8 +62,14 @@ async fn main() -> Result<()> {
                 },
                 max_commits_per_repo,
             };
-            let stats =
-                indexer::full_scan(&pool, &workspace, memory_dir.as_deref(), git_opts).await?;
+            let stats = indexer::full_scan(
+                &pool,
+                &workspace,
+                memory_dir.as_deref(),
+                git_opts,
+                domain.as_deref(),
+            )
+            .await?;
             pool.close().await;
             print_summary(
                 &stats,
@@ -215,6 +223,8 @@ async fn main() -> Result<()> {
             slug,
             all_slugs,
             rebuild,
+            workspace,
+            domain,
             db,
         } => {
             let projects_dir = match projects_dir.or_else(session_index::default_projects_dir) {
@@ -231,9 +241,17 @@ async fn main() -> Result<()> {
                     "scope required: --slug <s> for one workspace, or --all-slugs for machine-global"
                 ),
             };
+            let workspace = workspace.unwrap_or_else(|| std::path::PathBuf::from("."));
             let pool = db::open(&db).await?;
-            let stats =
-                session_index::index_sessions(&pool, &projects_dir, scope, rebuild).await?;
+            let stats = session_index::index_sessions(
+                &pool,
+                &projects_dir,
+                scope,
+                rebuild,
+                &workspace,
+                domain.as_deref(),
+            )
+            .await?;
             pool.close().await;
             println!(
                 "Indexed {} write-edge(s) ({} Edit, {} Write) across {} session(s) \
@@ -256,6 +274,15 @@ async fn main() -> Result<()> {
                  (run `nibdex index` first, or the edit predates HEAD)",
                 stats.commit_bound, stats.commit_unbound
             );
+            if domain.is_some() {
+                println!(
+                    "  domain [{}]: {} edge(s) dropped (foreign target), {} rationale(s) \
+                     withheld (cross-domain session)",
+                    domain.as_deref().unwrap_or(""),
+                    stats.edges_dropped_foreign_domain,
+                    stats.rationales_withheld
+                );
+            }
             if stats.lines_parse_err > 0 {
                 println!(
                     "  parsed {} line(s), {} unparseable (skipped)",

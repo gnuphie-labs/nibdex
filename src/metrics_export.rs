@@ -284,6 +284,7 @@ struct ExportSnapshot {
 struct ExportIndexer {
     documents: BTreeMap<String, String>,
     session_entries: String,
+    session_edges: String,
     memory_entries: String,
     design_doc_sections: String,
     source_chunks: String,
@@ -505,6 +506,7 @@ fn scrub_snapshot(c: &CheckResult) -> (ExportSnapshot, usize) {
         indexer: ExportIndexer {
             documents,
             session_entries: count_bucket(c.indexer.session_entries),
+            session_edges: count_bucket(c.indexer.session_edges),
             memory_entries: count_bucket(c.indexer.memory_entries),
             design_doc_sections: count_bucket(c.indexer.design_doc_sections),
             source_chunks: count_bucket(c.indexer.source_chunks),

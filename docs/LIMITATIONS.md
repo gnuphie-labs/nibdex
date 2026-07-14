@@ -58,13 +58,11 @@ Every event in the cost ledger carries `calibration_confidence: "estimated"`. Th
 
 **Implication:** the dollar figures are good for **trend and order-of-magnitude**, not for billing-grade accounting. Phase 2 introduces sampled counterfactual measurement to promote individual tool calibrations from `estimated` to `measured`. Until then, treat the ledger as evidence the tool is shifting tokens out of the prompt, not as a precise invoice.
 
-### Session-history extractor is author-formatted
+### The session corpus is transcript-derived, and machine-specific
 
-nibdex's session-history extractor parses the `## Recent session history (one-line)` section of the workspace's `CLAUDE.md` using a regex anchored to a specific entry shape (the format the author uses in this workspace). Workspaces whose `CLAUDE.md` follows a different convention will see zero or partial coverage in the `session_entries` corpus.
+`find_session` and `recent_sessions` are backed by the **session→code map** — `Edit`/`Write` actions recovered from your Claude Code transcripts via a separate `nibdex index-sessions` step (see the README). Two consequences: it's only as complete as your retained transcripts (recall starts at first index and grows forward — Claude Code prunes old transcripts, ~30 days by default), and it's inherently machine-specific, so unlike the other corpora it can't be reproduced from a clone.
 
-**Workaround today:** if your session-history shape differs and you want indexing, the extractor is in `src/extractor/session_history.rs`. The other corpora (git commits, memory entries, design docs) work regardless.
-
-**Phase 1b candidate:** a `--session-history-format <preset>` flag, or pluggable extractor configuration.
+**Legacy note.** Earlier nibdex parsed session entries from a specific `## Recent session history` CLAUDE.md shape into a `session_entries` corpus. That extractor still runs but **no query tool reads it** — the transcript map replaced it — and it will be removed in a future release. If `find_session` comes back empty, the cause is almost always that `nibdex index-sessions` hasn't been run yet, not a CLAUDE.md-format mismatch.
 
 ### File-watcher is daemon-only
 
@@ -83,6 +81,37 @@ For cross-corpus terms, `find_commit("rustFetch")` ranks the densest occurrence 
 ### Always-on indexing requires `git2`-readable repositories
 
 The git-commits corpus uses `libgit2` (via the `git2` crate). Repositories whose layout `git2` cannot read (corrupted refs, partial clones with missing-but-referenced objects, non-standard packed-ref formats) are reported as "shallow" or skipped in `check().indexed_repos`. The `indexer` field surfaces this so you know coverage is partial; nothing is silently dropped.
+
+### The IP-domain partition isolates artifacts, not sentences
+
+With `.nibdex-domains.toml` + `--domain`, a per-domain database is guaranteed — by a
+build-gating invariant test — to hold no **files, commits, design sections, or
+session edits** from another domain's tree, and no **rationale prose from a session
+that touched another domain's tree**. That guarantee is mechanical and needle-testable.
+
+What it does **not** do is judge what a sentence is *about*. A commit message or
+design note in a domain's own tree can name another domain and is indexed verbatim;
+a sentence typed in an otherwise single-domain session, with no tool call touching
+the other domain, taints nothing and is admitted. nibdex prevents mechanical
+commingling; it is not a semantic censor. The full CAN/CANNOT statement and the
+mitigation (context-separation discipline; separate workspaces for strict isolation)
+are in [SECURITY.md](../SECURITY.md#separating-ip-domains-multiple-clients-or-employers-on-one-machine).
+
+Two finer edges of the withholding, both spelled out in SECURITY.md: the taint
+tracking watches **path-bearing tool inputs** (`Edit`/`Write`/`Read`/`Grep`/`Glob`/
+`NotebookEdit`), so a `Bash` command, a path-less grep, or a `Task`/sub-agent doing
+foreign work does not taint a session; and the ratchet is scoped to a **transcript
+file**, so one logical session that resumes into a second `.jsonl` file is not
+tainted there by a foreign touch in the first. Both follow from preferring
+auditable, mechanical rules over guesswork — and, per the project's threat model,
+are graded by plausibility under normal single-developer use.
+
+**Two operational rules:** a per-domain database must be *born* in domain mode (do
+not re-index an unpartitioned db with `--domain`), and **narrowing** a domain's
+labels requires rebuilding that domain's db (indexing only adds; it never
+un-indexes a now-foreign row). Over-redaction — a session's rationale withheld
+because it read a workspace-root or another domain's file — is surfaced as a
+`rationales_withheld` count, not hidden.
 
 ### No telemetry — by design
 

@@ -11,8 +11,8 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use super::format::{
-    SessionRow, build_commit_result, build_session_result, finish_commit_envelope,
-    finish_session_envelope, summarize,
+    SessionEdgeRow, build_commit_result, build_session_edge_result, finish_commit_envelope,
+    finish_session_edge_envelope, summarize,
 };
 use super::fts5::{
     fts5_or_broadened, like_substring, match_count_with_or_fallback, sanitize_fts5_query,
@@ -22,32 +22,23 @@ use super::types::{
     DESIGN_DOC_TOTAL_BODY_BUDGET, DesignDocResult, FindCodeRequest, FindCommitRequest,
     FindDesignDocRequest, FindMemoryRequest, FindSessionRequest, MAX_LIMIT, MemoryResult,
     RecentCommitsRequest, RecentSessionsRequest, SOURCE_BODY_CHAR_LIMIT, SOURCE_TOTAL_BODY_BUDGET,
-    SUMMARY_CHAR_LIMIT, SessionResult, Stages, ToolEnvelope,
+    SUMMARY_CHAR_LIMIT, SessionEdgeResult, Stages, ToolEnvelope,
 };
 
 pub async fn run_recent_sessions(
     pool: &SqlitePool,
     req: &RecentSessionsRequest,
     stages: &mut Stages,
-) -> Result<ToolEnvelope<SessionResult>> {
+) -> Result<ToolEnvelope<SessionEdgeResult>> {
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let days = req.days.unwrap_or(DEFAULT_DAYS).max(1);
-    let cutoff_iso = sqlite_date_cutoff_iso(pool, days).await?;
+    let cutoff_unix = sqlite_unix_cutoff(pool, days).await?;
 
     if let Some(filter) = req.filter.as_deref().filter(|s| !s.trim().is_empty()) {
-        run_recent_sessions_with_filter(pool, filter, &cutoff_iso, limit, stages).await
+        run_recent_sessions_with_filter(pool, filter, cutoff_unix, limit, stages).await
     } else {
-        run_recent_sessions_without_filter(pool, &cutoff_iso, limit, stages).await
+        run_recent_sessions_without_filter(pool, cutoff_unix, limit, stages).await
     }
-}
-
-async fn sqlite_date_cutoff_iso(pool: &SqlitePool, days: i64) -> Result<String> {
-    let modifier = format!("-{days} days");
-    let (cutoff,): (String,) = sqlx::query_as("SELECT date('now', ?)")
-        .bind(modifier)
-        .fetch_one(pool)
-        .await?;
-    Ok(cutoff)
 }
 
 async fn sqlite_unix_cutoff(pool: &SqlitePool, days: i64) -> Result<i64> {
@@ -61,33 +52,43 @@ async fn sqlite_unix_cutoff(pool: &SqlitePool, days: i64) -> Result<i64> {
 
 async fn run_recent_sessions_without_filter(
     pool: &SqlitePool,
-    cutoff_iso: &str,
+    cutoff_unix: i64,
     limit: i64,
     stages: &mut Stages,
-) -> Result<ToolEnvelope<SessionResult>> {
+) -> Result<ToolEnvelope<SessionEdgeResult>> {
     let t0 = Instant::now();
     let (total,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM session_entries \
-         WHERE entry_date IS NULL OR entry_date >= ?",
+        "SELECT COUNT(DISTINCT session_id) FROM session_edges WHERE edited_at >= ?",
     )
-    .bind(cutoff_iso)
+    .bind(cutoff_unix)
     .fetch_one(pool)
     .await?;
     stages.join_ms = t0.elapsed().as_millis() as u64;
 
     let t1 = Instant::now();
-    let rows: Vec<SessionRow> = sqlx::query_as(
-        // D-10.12: order by session_number, the only monotonic, always-present chronology
-        // signal. `entry_date` is the first YYYY-MM-DD found in the body text (often a
-        // quoted soak deadline or NULL for the newest entries), so ordering by it surfaced
-        // 30-session-old entries as "most recent" and dropped the newest ones entirely.
-        "SELECT session_number, entry_date, body, files_touched, todos_mentioned, decisions_made \
-             FROM session_entries \
-             WHERE entry_date IS NULL OR entry_date >= ? \
-             ORDER BY session_number DESC \
-             LIMIT ?",
+    let rows: Vec<SessionEdgeRow> = sqlx::query_as(
+        // One representative row per session — the most-recent edge in each — ordered
+        // by that latest edit DESC. Recency by `edited_at` is the session analogue of
+        // the commit corpus's `authored_at`; there is no body-date confound here (the
+        // D-10.12 session_number hazard was a session_entries-only artifact). Same flat
+        // SessionEdgeResult shape as find_session, so the session surface is coherent.
+        "SELECT session_id, tool, file_path, repo_path, git_branch, edited_at, \
+                rationale, commit_hash, message_summary \
+         FROM ( \
+           SELECT se.session_id, se.tool, se.file_path, se.repo_path, se.git_branch, \
+                  se.edited_at, se.rationale, ce.commit_hash, ce.message_summary, \
+                  ROW_NUMBER() OVER ( \
+                    PARTITION BY se.session_id ORDER BY se.edited_at DESC, se.id DESC \
+                  ) AS rn \
+           FROM session_edges se \
+           LEFT JOIN commit_entries ce ON ce.id = se.commit_id \
+           WHERE se.edited_at >= ? \
+         ) \
+         WHERE rn = 1 \
+         ORDER BY edited_at DESC \
+         LIMIT ?",
     )
-    .bind(cutoff_iso)
+    .bind(cutoff_unix)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -96,9 +97,9 @@ async fn run_recent_sessions_without_filter(
     let t2 = Instant::now();
     let results = rows
         .into_iter()
-        .map(|r| build_session_result(r, None))
+        .map(|r| build_session_edge_result(r, None))
         .collect();
-    let envelope = finish_session_envelope(results, total, "recent_sessions", false);
+    let envelope = finish_session_edge_envelope(results, total, "recent_sessions", false);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
     Ok(envelope)
 }
@@ -106,50 +107,48 @@ async fn run_recent_sessions_without_filter(
 async fn run_recent_sessions_with_filter(
     pool: &SqlitePool,
     filter: &str,
-    cutoff_iso: &str,
+    cutoff_unix: i64,
     limit: i64,
     stages: &mut Stages,
-) -> Result<ToolEnvelope<SessionResult>> {
+) -> Result<ToolEnvelope<SessionEdgeResult>> {
     let match_filter = sanitize_fts5_query(filter);
     let t0 = Instant::now();
     let (total,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) \
+        "SELECT COUNT(DISTINCT se.session_id) \
          FROM search_index s \
-         JOIN session_entries e ON e.id = s.rowid_ref AND s.source_table = 'session_entries' \
-         WHERE s.body MATCH ? \
-           AND (e.entry_date IS NULL OR e.entry_date >= ?)",
+         JOIN session_edges se ON se.id = s.rowid_ref AND s.source_table = 'session_edges' \
+         WHERE s.body MATCH ? AND se.edited_at >= ?",
     )
     .bind(&match_filter)
-    .bind(cutoff_iso)
+    .bind(cutoff_unix)
     .fetch_one(pool)
     .await?;
     stages.fts5_query_ms = t0.elapsed().as_millis() as u64;
 
-    type Row = (
-        i64,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        f64,
-    );
     let t1 = Instant::now();
-    let rows: Vec<Row> = sqlx::query_as(
-        // D-10.12: recency by session_number (see run_recent_sessions_without_filter),
-        // bm25 rank only as a tiebreaker among equal — i.e. never — session numbers.
-        "SELECT e.session_number, e.entry_date, e.body, \
-                e.files_touched, e.todos_mentioned, e.decisions_made, \
-                bm25(search_index) AS rank \
-         FROM search_index s \
-         JOIN session_entries e ON e.id = s.rowid_ref AND s.source_table = 'session_entries' \
-         WHERE s.body MATCH ? \
-           AND (e.entry_date IS NULL OR e.entry_date >= ?) \
-         ORDER BY e.session_number DESC, rank ASC \
+    let rows: Vec<SessionEdgeRow> = sqlx::query_as(
+        // Most-recent MATCHING edge per session, recency-ordered. Recency is the
+        // contract of recent_sessions, so the filter narrows which sessions appear;
+        // ranking stays chronological (bm25 is find_session's job).
+        "SELECT session_id, tool, file_path, repo_path, git_branch, edited_at, \
+                rationale, commit_hash, message_summary \
+         FROM ( \
+           SELECT se.session_id, se.tool, se.file_path, se.repo_path, se.git_branch, \
+                  se.edited_at, se.rationale, ce.commit_hash, ce.message_summary, \
+                  ROW_NUMBER() OVER ( \
+                    PARTITION BY se.session_id ORDER BY se.edited_at DESC, se.id DESC \
+                  ) AS rn \
+           FROM search_index s \
+           JOIN session_edges se ON se.id = s.rowid_ref AND s.source_table = 'session_edges' \
+           LEFT JOIN commit_entries ce ON ce.id = se.commit_id \
+           WHERE s.body MATCH ? AND se.edited_at >= ? \
+         ) \
+         WHERE rn = 1 \
+         ORDER BY edited_at DESC \
          LIMIT ?",
     )
     .bind(&match_filter)
-    .bind(cutoff_iso)
+    .bind(cutoff_unix)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -158,20 +157,27 @@ async fn run_recent_sessions_with_filter(
     let t2 = Instant::now();
     let results = rows
         .into_iter()
-        .map(|(sn, ed, b, ft, tm, dm, rank)| {
-            build_session_result((sn, ed, b, ft, tm, dm), Some(rank))
-        })
+        .map(|r| build_session_edge_result(r, None))
         .collect();
-    let envelope = finish_session_envelope(results, total, "recent_sessions", false);
+    let envelope = finish_session_edge_envelope(results, total, "recent_sessions", false);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
     Ok(envelope)
 }
 
+/// Search the raw-transcript session→code map (`session_edges`, Gear 7/8) by FTS5
+/// relevance. Promoted from the hidden CLI spike `find-session-edge` (punch-list
+/// #3): the spike bound the query raw; this uses the production FTS path
+/// (`sanitize_fts5_query` + OR-broaden), LEFT JOINs `commit_entries` so every hit
+/// carries its capturing commit, and returns the flat per-edit `SessionEdgeResult`.
+/// (The legacy `session_entries` corpus — empty on nearly every workspace since it
+/// parses only the outgrown `## Recent session history` CLAUDE.md format — is no
+/// longer read by any query tool: `recent_sessions` moved to `session_edges` too.
+/// The table + extractor remain during the transition; full removal is deferred.)
 pub async fn run_find_session(
     pool: &SqlitePool,
     req: &FindSessionRequest,
     stages: &mut Stages,
-) -> Result<ToolEnvelope<SessionResult>> {
+) -> Result<ToolEnvelope<SessionEdgeResult>> {
     let query = req.query.trim();
     if query.is_empty() {
         return Err(anyhow::anyhow!("query must not be empty"));
@@ -181,7 +187,7 @@ pub async fn run_find_session(
 
     const COUNT_SQL: &str = "SELECT COUNT(*) \
          FROM search_index s \
-         JOIN session_entries e ON e.id = s.rowid_ref AND s.source_table = 'session_entries' \
+         JOIN session_edges se ON se.id = s.rowid_ref AND s.source_table = 'session_edges' \
          WHERE s.body MATCH ?";
     let t0 = Instant::now();
     let (match_query, total, broadened) =
@@ -189,23 +195,27 @@ pub async fn run_find_session(
     stages.fts5_query_ms = t0.elapsed().as_millis() as u64;
 
     type Row = (
-        i64,
-        Option<String>,
+        String,
+        String,
         String,
         Option<String>,
+        Option<String>,
+        i64,
+        String,
         Option<String>,
         Option<String>,
         f64,
     );
     let t1 = Instant::now();
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT e.session_number, e.entry_date, e.body, \
-                e.files_touched, e.todos_mentioned, e.decisions_made, \
+        "SELECT se.session_id, se.tool, se.file_path, se.repo_path, se.git_branch, \
+                se.edited_at, se.rationale, ce.commit_hash, ce.message_summary, \
                 bm25(search_index) AS rank \
          FROM search_index s \
-         JOIN session_entries e ON e.id = s.rowid_ref AND s.source_table = 'session_entries' \
+         JOIN session_edges se ON se.id = s.rowid_ref AND s.source_table = 'session_edges' \
+         LEFT JOIN commit_entries ce ON ce.id = se.commit_id \
          WHERE s.body MATCH ? \
-         ORDER BY rank ASC, e.session_number DESC \
+         ORDER BY rank ASC, se.edited_at DESC \
          LIMIT ?",
     )
     .bind(&match_query)
@@ -217,11 +227,11 @@ pub async fn run_find_session(
     let t2 = Instant::now();
     let results = rows
         .into_iter()
-        .map(|(sn, ed, b, ft, tm, dm, rank)| {
-            build_session_result((sn, ed, b, ft, tm, dm), Some(rank))
+        .map(|(sid, tool, fp, rp, gb, ea, rat, ch, cs, rank)| {
+            build_session_edge_result((sid, tool, fp, rp, gb, ea, rat, ch, cs), Some(rank))
         })
         .collect();
-    let envelope = finish_session_envelope(results, total, "find_session", broadened);
+    let envelope = finish_session_edge_envelope(results, total, "find_session", broadened);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
     Ok(envelope)
 }

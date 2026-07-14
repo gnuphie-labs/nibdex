@@ -299,6 +299,7 @@ fn scrub_snapshot_drops_unsafe_map_keys() {
                 ("/Users/you/work/acme-dashboard".to_string(), 1),
             ]),
             session_entries: 3,
+            session_edges: 0,
             memory_entries: 0,
             design_doc_sections: 0,
             source_chunks: 0,
@@ -420,6 +421,7 @@ fn drift_check_result_fields_are_all_classified() {
         indexer: IndexerCounts {
             documents: BTreeMap::from([("session_history".to_string(), 1)]),
             session_entries: 1,
+            session_edges: 1,
             memory_entries: 1,
             design_doc_sections: 1,
             source_chunks: 1,
@@ -468,8 +470,9 @@ fn drift_check_result_fields_are_all_classified() {
     assert_eq!(
         keys(&v["indexer"]),
         expected(&[
-            "documents", "session_entries", "memory_entries", "design_doc_sections",
-            "source_chunks", "commit_entries", "indexed_repos", "search_index_total",
+            "documents", "session_entries", "session_edges", "memory_entries",
+            "design_doc_sections", "source_chunks", "commit_entries", "indexed_repos",
+            "search_index_total",
         ]),
         "IndexerCounts drifted"
     );

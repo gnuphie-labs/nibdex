@@ -73,24 +73,108 @@ These are documented design decisions (see
 
 ### Separating IP domains (multiple clients or employers on one machine)
 
-nibdex indexes one workspace into one database. If you keep separate IP domains on
-the same machine — personal vs. employer, or several clients — run **one nibdex
-instance per domain**, each with its own `--db`, `--workspace`, and (for `serve`)
-`--http` port:
+If you keep separate IP domains on the same machine — personal vs. employer, or
+several clients — there are two ways to keep their indexes apart, strongest first.
+
+**1. Physically separate workspaces (strongest).** Run one nibdex instance per
+domain, each with its own `--db`, `--workspace`, and (for `serve`) `--http` port:
 
 ```
 nibdex serve --http 127.0.0.1:17878 --workspace ~/personal --db ~/personal.db
 nibdex serve --http 127.0.0.1:17879 --workspace ~/client-a --db ~/client-a.db
 ```
 
-Because each daemon opens only its own database file, a domain's index *physically*
+Each daemon opens only its own database file, so a domain's index *physically*
 cannot contain another domain's content — the boundary is the filesystem and
-process, not a query filter, so no query bug can cross it. Session-history indexing
-(`index-sessions`) reinforces this: it **requires** an explicit `--slug` or
-`--all-slugs`, so it never silently pulls another workspace's transcripts into the
-wrong database. This makes nibdex refrain from commingling domains *itself*; it is
-not an OS-level vault — for strict contractual isolation, separate user accounts or
-machines remain the stronger boundary.
+process, not a query filter, and no query bug can cross it.
+
+**2. One workspace, several domains (the `--domain` partition).** When the domains
+share a workspace (e.g. one repo folder mixing personal and client subdirs), label
+each top-level subdir in a `.nibdex-domains.toml` at the workspace root:
+
+```toml
+[domains]
+personal = ["my-app", "my-lib", "oss-lib"]   # a subdir listed under two
+client-a = ["acme-api", "acme-web", "oss-lib"] # domains is shared with both
+```
+
+Then build one **separate database per domain** with `--domain`, and query each
+through its own stdio MCP server pointed at that database:
+
+```
+nibdex index          --domain client-a --workspace ~/ws --db ~/client-a.db
+nibdex index-sessions --domain client-a --workspace ~/ws --all-slugs --db ~/client-a.db
+nibdex mcp            --db ~/client-a.db     # this domain's query server (read-only)
+```
+
+> **Domain databases are index-only — do not point the file-watching daemon
+> (`nibdex serve` / `nibdex watch`) at one over the shared workspace.** The watcher
+> is not domain-aware: it re-indexes every repository and the memory directory it
+> discovers into whatever database it holds, which would write *another* domain's
+> commits and source back into this one and break the guarantee below. In domain
+> mode a database is a point-in-time snapshot — refresh it by re-running
+> `nibdex index --domain client-a …` (and `index-sessions`). A domain-aware daemon
+> is planned; until then, keep domain databases on the manual-reindex path and
+> query them with a per-database `nibdex mcp` (which only reads).
+
+`--domain client-a` writes **only** that domain's labeled subdirs into `client-a.db`
+— across source, commits, design sections, **and** session edits. The guarantee,
+which is **mechanical and needle-testable** (it is enforced by an invariant test
+that fails the build on any cross-domain byte):
+
+- A domain's database never contains **files, commits, design sections, or session
+  edits from another domain's tree**, and never contains **rationale prose from a
+  session that also touched another domain's tree**. When a single Claude session
+  edits across domains — or merely *reads/greps* another domain's file — that
+  session's rationale is withheld (replaced by a constant marker, never indexed)
+  from the first cross point onward, so the reasoning text can't launder foreign
+  content across. A foreign checkout's working-directory path and branch name are
+  dropped from the row.
+
+What this **cannot** claim:
+
+- A domain's database contains no *information about* another domain. nibdex
+  prevents mechanical *commingling* of one domain's artifacts into another's index;
+  it is **not a semantic censor** of freely-typed sentences. A commit message or a
+  design note in domain A's own tree can name domain B ("refactor auth like the
+  acme flow"), and that line is indexed into A's database as written. Likewise a
+  sentence you type in an otherwise single-domain session — "mirror client-a's
+  rotation policy here" — with no tool call touching client-a's files taints
+  nothing, so it is admitted. Closing this would require judging what a sentence is
+  "about," which is unreliable and — worse — unauditable, so nibdex draws the line
+  at what it can prove.
+- A **complete** guard against every foreign-content vector. The taint set that
+  drives the withholding is built from **path-bearing tool inputs** —
+  `Edit`/`Write`/`Read`/`Grep`/`Glob`/`NotebookEdit` file targets. Vectors that
+  carry no parseable path do **not** taint the session: a `Bash` command
+  (`cat ../client-a/secret.env`), a path-less `Grep` that scans the working
+  directory, or a `Task`/sub-agent doing foreign work. Content pulled in those ways
+  can still reach a later rationale — a real gap, common enough to state plainly.
+  The ratchet closes the tool-mediated *file* vectors; the context-separation
+  discipline below covers the rest.
+
+The mitigation for that residual is the same discipline nibdex is built around:
+classify work by which context is active and don't cross-pollinate one domain's
+detail into another domain's session. For strict contractual isolation, option 1
+(separate workspaces) or separate user accounts/machines remain the stronger
+boundary. Session indexing also **requires** an explicit `--slug` or `--all-slugs`,
+so it never silently pulls another workspace's transcripts into the wrong database.
+
+**Coverage note — a domain database indexes less.** It is built from that domain's
+labeled subdirs only, so two things are absent *by design*: the **memory corpus**
+(`find_memory` returns nothing — memory is workspace-global and isn't attributed to a
+domain), and **workspace-root files** that belong to no subdir (a root-level README or
+tracker is attributed to no domain, so it is indexed into none). Neither is a leak;
+both are fail-narrow omissions worth knowing when a domain db's `find_memory` or a
+root-doc lookup comes back empty.
+
+**Operational note — domain databases are born in domain mode.** A per-domain
+database must be created by a `--domain` run from the start; do not convert an
+unpartitioned database by re-indexing it with `--domain` (its pre-existing rows are
+not retro-filtered). And because indexing only ever *adds*, **narrowing** a domain's
+labels (removing a subdir from it) does not un-index the now-foreign rows — rebuild
+that domain's database after narrowing (the simplest way is to delete the database
+file and re-index; `index-sessions --rebuild` wipes just the session edges).
 
 ## Redaction stance
 

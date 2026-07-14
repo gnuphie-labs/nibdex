@@ -101,7 +101,7 @@ through a named derivation in §5. **DROP** = never appears in the payload.
 | `schema_version` | i64 | **ALLOW** | metadata |
 | `daemon_uptime_s` | i64 | **ALLOW** | longevity |
 | `indexer.documents` | BTreeMap\<kind,count\> | **keys ALLOW, counts TRANSFORM → bucket** (§5.2) | keys are doc-*type* categories (`session_history`, `git_commit`), not repo names — verified `check.rs:78` |
-| `indexer.{session_entries,memory_entries,design_doc_sections,source_chunks,commit_entries,indexed_repos,search_index_total}` | i64 | **TRANSFORM → bucket** (§5.2) | exact corpus counts are a weak fingerprint; buckets preserve the "does value scale with corpus size" signal. `source_chunks` (D1a) is the source-corpus analogue of `design_doc_sections`. See §8 open-decision 1 |
+| `indexer.{session_entries,session_edges,memory_entries,design_doc_sections,source_chunks,commit_entries,indexed_repos,search_index_total}` | i64 | **TRANSFORM → bucket** (§5.2) | exact corpus counts are a weak fingerprint; buckets preserve the "does value scale with corpus size" signal. `source_chunks` (D1a) is the source-corpus analogue of `design_doc_sections`; `session_edges` is the raw-transcript session corpus behind `find_session`/`recent_sessions`. See §8 open-decision 1 |
 | `orphans.*` (4 counts) | i64 | **TRANSFORM → bucket** (§5.2) | index-health signal, bucketed |
 | `shallow_repos` | Vec\<String\> | **TRANSFORM → count only** (§5.3) | values are `repo_path` strings (`check.rs:113`) — **paths/names, UNSAFE**. The *count* of shallow repos is the only useful signal |
 | `perf_p50_ms` / `perf_p95_ms` | BTreeMap\<tool,ms\> | **ALLOW** | keys are nibdex tool names |

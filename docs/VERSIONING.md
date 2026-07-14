@@ -28,12 +28,19 @@ The phased differentiator roadmap in DESIGN §4 maps loosely to minor bumps:
 
 | Roadmap phase | Earliest version | Notes |
 |---|---|---|
-| Phase 1a (D2 + D0 — current MVP) | `0.1.x` | Public debut |
-| Phase 1b (D1 + D3) | `0.2.x` | Workspace lexical search + richer MCP surface |
+| Phase 1a (D2 + D0) | `0.1.x` | Public debut |
+| Phase 1b (D1 + D3 — current) | `0.2.x` | Transcript session index (`find_session`/`recent_sessions`) + IP-domain partition + the D1 tail + richer MCP surface |
 | Phase 2 (D4–D6) | `0.3.x` – `0.5.x` | Derived graph + provenance + source-change cache invalidation |
 | Phase 3 (D7–D9) | `0.6.x` – `0.9.x` | Answer cache + semantic fallback + alternative storage backends |
 
 Phases are **not promises with dates.** They are the lane order. A phase may take one minor bump or three depending on what the dogfood signal surfaces.
+
+### The `0.2.x` line — coherence + isolation
+
+Two things define `0.2.x`, and both illustrate why `0.x` reserves the right to change the public contract between minors:
+
+- **The transcript-based session index.** `find_session` and `recent_sessions` now return per-edit records recovered from Claude Code transcripts — the file, the rationale, and the capturing commit — replacing the empty CLAUDE.md-format corpus. This **changes their return shape** from `0.1.x` (no `session_number`/`todos_mentioned`/`decisions_made`; a flat per-edit record instead). Exactly the kind of contract change the policy above reserves for a minor bump.
+- **The IP-domain partition** — a cross-cutting isolation capability ([`IP_DOMAINS.md`](IP_DOMAINS.md)) that spans every corpus, orthogonal to the D-lane roadmap. It is the visible headline of this line.
 
 ## Why this posture
 

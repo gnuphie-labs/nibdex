@@ -8,6 +8,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use walkdir::WalkDir;
 
+use crate::domains::DomainConfig;
 use crate::extractor::design_doc;
 use crate::extractor::git_commits::{self, NestedMode};
 use crate::extractor::memory;
@@ -119,11 +120,31 @@ pub fn default_memory_dir(workspace: &Path) -> Option<PathBuf> {
     )
 }
 
+/// Which subset of the workspace an index pass writes: a single IP domain
+/// (docs/SESSION_SCOPE_DESIGN.md §0), or the whole workspace when `None`. `Copy`
+/// — it is two references, passed by value into the discovery filters.
+#[derive(Clone, Copy)]
+struct DomainScope<'a> {
+    config: &'a DomainConfig,
+    domain: &'a str,
+}
+
+impl DomainScope<'_> {
+    /// Does `path` (a repo/anchor path) belong to this domain? Canonicalizes
+    /// `path` so it lines up with the already-canonicalized `workspace`.
+    fn keeps(&self, workspace: &Path, path: &Path) -> bool {
+        let canon = path.canonicalize();
+        let path = canon.as_deref().unwrap_or(path);
+        self.config.includes(self.domain, workspace, path)
+    }
+}
+
 pub async fn full_scan(
     pool: &SqlitePool,
     workspace: &Path,
     memory_dir: Option<&Path>,
     git_opts: GitOptions,
+    domain: Option<&str>,
 ) -> Result<ScanStats> {
     let op = Op::start("indexer.full_scan");
     let started = Instant::now();
@@ -133,12 +154,41 @@ pub async fn full_scan(
         .canonicalize()
         .with_context(|| format!("canonicalize workspace {workspace:?}"))?;
 
+    // Domain scope (docs/SESSION_SCOPE_DESIGN.md §0): with `--domain`, this pass
+    // writes ONLY that domain's labeled subdirs (per `.nibdex-domains.toml`) into
+    // the db, so a domain's db never holds another domain's content. `None` =
+    // index the whole workspace (unpartitioned; today's behavior).
+    let domain_config = DomainConfig::load(&workspace)?;
+    let scope: Option<DomainScope> = match domain {
+        Some(d) => {
+            let config = domain_config.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--domain {d} requested but no .nibdex-domains.toml at {}",
+                    workspace.display()
+                )
+            })?;
+            if !config.has_domain(d) {
+                anyhow::bail!(
+                    "--domain {d} is not declared in .nibdex-domains.toml (declared: {:?})",
+                    config.domain_names()
+                );
+            }
+            Some(DomainScope { config, domain: d })
+        }
+        None => None,
+    };
+    let keeps = |p: &Path| scope.is_none_or(|s| s.keeps(&workspace, p));
+
     // Project anchors drive session_history + design_doc discovery. Each anchor
     // = the workspace root or a discovered git repo root (see
     // `discover_project_anchors`). Per-anchor scope means a nested CLAUDE.md
     // resolves its `files_touched` references against its own project root,
-    // not the parent workspace.
-    let anchors = discover_project_anchors(&workspace, git_opts);
+    // not the parent workspace. In domain mode the anchors are filtered to the
+    // domain's subdirs (the workspace root belongs to no domain, so it drops).
+    let anchors: Vec<PathBuf> = discover_project_anchors(&workspace, git_opts)
+        .into_iter()
+        .filter(|a| keeps(a))
+        .collect();
 
     // 1. session_history — one `$ANCHOR/CLAUDE.md` per project anchor.
     for anchor in &anchors {
@@ -158,7 +208,10 @@ pub async fn full_scan(
     let memory = memory_dir
         .map(Path::to_path_buf)
         .or_else(|| default_memory_dir(&workspace));
-    if let Some(mem) = memory.as_ref()
+    // Memory is workspace-global (one dir, not per-subdir) → not domain-
+    // attributable; skip it in domain mode (Gear 2 decides its routing).
+    if scope.is_none()
+        && let Some(mem) = memory.as_ref()
         && mem.exists()
     {
         let mem_result = run_memory_extractor(pool, mem).await?;
@@ -184,7 +237,7 @@ pub async fn full_scan(
     }
 
     // 4. git commits — HEAD ancestry walk across every discovered repo.
-    let commit_stats = run_git_commits_extractor(pool, &workspace, git_opts).await?;
+    let commit_stats = run_git_commits_extractor(pool, &workspace, git_opts, scope).await?;
     stats.repos_indexed = commit_stats.repos_indexed;
     stats.repos_capped = commit_stats.repos_capped;
     stats.repos_shallow = commit_stats.repos_shallow;
@@ -197,6 +250,9 @@ pub async fn full_scan(
     // must be indexed first so the one-corpus-per-file skip leaves their files to
     // them (source_index::is_owned_by_other_corpus). One repo at a time.
     for repo in git_commits::discover_repos(&workspace, git_opts.max_depth, git_opts.nested_mode) {
+        if !keeps(&repo) {
+            continue;
+        }
         let src = crate::source_index::index_source_repo(pool, &repo).await?;
         stats.source_files += src.files_indexed as u32;
         stats.source_chunks += src.chunks as u32;
@@ -825,11 +881,15 @@ async fn run_git_commits_extractor(
     pool: &SqlitePool,
     workspace: &Path,
     opts: GitOptions,
+    scope: Option<DomainScope<'_>>,
 ) -> Result<GitExtractorResult> {
     let op = Op::start("extract.commits");
     let started = Instant::now();
 
-    let repos = git_commits::discover_repos(workspace, opts.max_depth, opts.nested_mode);
+    let repos: Vec<PathBuf> = git_commits::discover_repos(workspace, opts.max_depth, opts.nested_mode)
+        .into_iter()
+        .filter(|r| scope.is_none_or(|s| s.keeps(workspace, r)))
+        .collect();
     let mut commits_inserted: u32 = 0;
     let mut repos_capped: u32 = 0;
     let mut repos_shallow: u32 = 0;
@@ -1266,7 +1326,7 @@ mod tests {
             .unwrap();
         }
 
-        let stats = full_scan(&pool, root, None, GitOptions::default())
+        let stats = full_scan(&pool, root, None, GitOptions::default(), None)
             .await
             .unwrap();
 
@@ -1278,6 +1338,72 @@ mod tests {
             "expected >=4 sections (1 doc heading + 2 sections × 2 docs); got {}",
             stats.design_sections,
         );
+    }
+
+    /// SESSION_SCOPE_DESIGN §0 — the domain-isolation INVARIANT: a `--domain` pass
+    /// writes ONLY that domain's labeled subdirs, so a domain's db never holds
+    /// another domain's content. This is the guardrail every later gear must keep
+    /// green; it fails loudly the instant routing leaks across domains.
+    #[tokio::test]
+    async fn full_scan_domain_isolates_source_and_commits_per_db() {
+        // Two labeled projects in ONE workspace, each a git repo with a committed
+        // source file. `.nibdex-domains.toml` maps proj-a→alpha, proj-b→beta.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (proj, file, body, msg) in [
+            ("proj-a", "alpha.rs", "pub fn alpha_widget() {}", "proj-a: alpha"),
+            ("proj-b", "beta.rs", "pub fn beta_gadget() {}", "proj-b: beta"),
+        ] {
+            let dir = root.join(proj);
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = git2::Repository::init(&dir).unwrap();
+            std::fs::write(dir.join(file), body).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new(file)).unwrap();
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("t", "t@t").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[]).unwrap();
+        }
+        std::fs::write(
+            root.join(".nibdex-domains.toml"),
+            "[domains]\nalpha = [\"proj-a\"]\nbeta = [\"proj-b\"]\n",
+        )
+        .unwrap();
+
+        // Index each domain into its own db.
+        let alpha = fresh_pool().await;
+        full_scan(&alpha, root, None, GitOptions::default(), Some("alpha"))
+            .await
+            .unwrap();
+        let beta = fresh_pool().await;
+        full_scan(&beta, root, None, GitOptions::default(), Some("beta"))
+            .await
+            .unwrap();
+
+        // Count content (source docs + commits) whose path/repo mentions `needle`.
+        async fn mentions(pool: &SqlitePool, needle: &str) -> i64 {
+            let like = format!("%{needle}%");
+            let docs: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM documents WHERE kind='source' AND path LIKE ?")
+                    .bind(&like)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            let commits: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM commit_entries WHERE repo_path LIKE ?")
+                    .bind(&like)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            docs + commits
+        }
+
+        // THE INVARIANT: each db holds its own domain's content and ZERO of the other's.
+        assert!(mentions(&alpha, "proj-a").await > 0, "alpha.db must contain proj-a");
+        assert_eq!(mentions(&alpha, "proj-b").await, 0, "alpha.db must NOT contain proj-b");
+        assert!(mentions(&beta, "proj-b").await > 0, "beta.db must contain proj-b");
+        assert_eq!(mentions(&beta, "proj-a").await, 0, "beta.db must NOT contain proj-a");
     }
 
     /// D1 gear-6 fix: design docs directly under `docs/` (NOT a `docs/design/`
@@ -1307,7 +1433,7 @@ mod tests {
         )
         .unwrap();
 
-        let stats = full_scan(&pool, root, None, GitOptions::default())
+        let stats = full_scan(&pool, root, None, GitOptions::default(), None)
             .await
             .unwrap();
 
@@ -1343,7 +1469,7 @@ mod tests {
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("DESIGN.md"), "# Design\n\n## Goals\n\ngoals body\n").unwrap();
 
-        let stats = full_scan(&pool, root, None, GitOptions::default())
+        let stats = full_scan(&pool, root, None, GitOptions::default(), None)
             .await
             .unwrap();
 

@@ -53,6 +53,13 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         include_nested_repos: bool,
 
+        /// IP domain to index — a key in `.nibdex-domains.toml` at the workspace
+        /// root. Writes ONLY that domain's labeled subdirs into `--db`, so a
+        /// domain's db never holds another domain's content. Omit to index the
+        /// whole workspace. See docs/IP_DOMAINS.md.
+        #[arg(long)]
+        domain: Option<String>,
+
         /// Cap per repo to defend against pathological histories (DESIGN §9.12).
         #[arg(long, default_value_t = 50_000)]
         max_commits_per_repo: usize,
@@ -149,13 +156,14 @@ pub enum Command {
         cap: i64,
     },
 
-    /// D1 SPIKE (docs/D1_SCOPE.md §10 "Session-coverage probe", gear 7): index the
-    /// RAW Claude transcripts under `~/.claude/projects/<slug>/*.jsonl` into the
-    /// `session_edges` map — one row per `Edit`/`Write` tool-call (the change) +
-    /// the nearest preceding assistant text (the rationale), branch/cwd/time-
-    /// anchored, best-effort bound to the commit that captured it. Run `nibdex
-    /// index` first on the same `--db` so the session→commit binding resolves.
-    #[command(hide = true)]
+    /// Index Claude session transcripts (`~/.claude/projects/<slug>/*.jsonl`) into
+    /// the `session_edges` map — one row per `Edit`/`Write` tool-call (the change)
+    /// plus the nearest preceding assistant text (the rationale), branch/cwd/time-
+    /// anchored and best-effort bound to the commit that captured it. Scope is
+    /// REQUIRED (`--slug` or `--all-slugs`) so a run never silently ingests another
+    /// workspace's transcripts. With `--domain`, only that domain's labeled subdirs'
+    /// edits are written (per-domain session isolation). Run `nibdex index` first on
+    /// the same `--db` so the session→commit binding resolves.
     IndexSessions {
         /// Transcript root. Defaults to `~/.claude/projects`.
         #[arg(long)]
@@ -176,6 +184,20 @@ pub enum Command {
         /// an additive merge that never drops previously-indexed edges.
         #[arg(long, default_value_t = false)]
         rebuild: bool,
+
+        /// Workspace root — where `.nibdex-domains.toml` lives, used to resolve
+        /// which subdir each edit belongs to when `--domain` is set. Defaults to
+        /// the current directory. Ignored in unpartitioned mode.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+
+        /// IP domain to index sessions for — a key in `.nibdex-domains.toml`.
+        /// Writes ONLY edits under that domain's labeled subdirs into `--db`, and
+        /// withholds rationale prose from any session that also touched another
+        /// domain's tree (see docs/IP_DOMAINS.md). Omit for unpartitioned mode
+        /// (whole workspace, byte-for-byte today's behavior).
+        #[arg(long)]
+        domain: Option<String>,
 
         /// SQLite database path.
         #[arg(long, default_value = "nibdex.db")]

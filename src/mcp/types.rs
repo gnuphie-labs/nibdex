@@ -77,15 +77,39 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One session→code edge (Gear 7/8): a single Edit/Write tool-call recovered
+/// from a raw Claude Code transcript — the file it touched, the assistant text
+/// that reasoned about it, and the commit that later captured it (when bound).
+/// This is the flat per-edit shape `find_session` returns now that it reads the
+/// `session_edges` corpus instead of the format-locked `session_entries` table
+/// (punch-list #3; grouped-by-session is a POST-MVP fast-follow).
 #[derive(Debug, Serialize, JsonSchema)]
-pub struct SessionResult {
-    pub session_number: i64,
-    pub entry_date: Option<String>,
-    pub summary: String,
-    pub body: String,
-    pub files_touched: Value,
-    pub todos_mentioned: Value,
-    pub decisions_made: Value,
+pub struct SessionEdgeResult {
+    /// The transcript's sessionId — the session these edges belong to.
+    pub session_id: String,
+    /// The tool that produced the edge: `Edit` or `Write`.
+    pub tool: String,
+    /// Repo-relative path the edit targeted (cwd-stripped at index time).
+    pub file_path: String,
+    /// The cwd at edit time (the repo-root candidate); NULL when unrecorded or
+    /// NULLed because the edit's cwd was not domain-visible (Gear 2).
+    pub repo_path: Option<String>,
+    /// Per-line `gitBranch` at edit time — the commit join key.
+    pub git_branch: Option<String>,
+    pub edited_at_iso: String,
+    pub edited_at_unix: i64,
+    /// The nearest preceding assistant text — the "why" of the edit. This is the
+    /// FTS body (rationale + path), so a concept query surfaces the edit by its
+    /// reasoning, not just its path. `[rationale withheld: cross-domain session]`
+    /// when the Gear 2 ratchet withheld it.
+    pub rationale: String,
+    /// Short SHA (first 7) of the capturing commit, when the session→commit
+    /// binding surfaced. NULL when no indexed commit captured this edit.
+    pub commit_hash: Option<String>,
+    /// Full 40-char SHA of the capturing commit, when bound.
+    pub commit_hash_full: Option<String>,
+    /// Summary line of the capturing commit, when bound.
+    pub commit_summary: Option<String>,
     pub rank: Option<f64>,
 }
 
@@ -215,7 +239,13 @@ pub struct CheckResult {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct IndexerCounts {
     pub documents: BTreeMap<String, i64>,
+    /// Legacy CLAUDE.md-format session corpus. Still extracted, but no query tool
+    /// reads it since `find_session`/`recent_sessions` moved to `session_edges`;
+    /// kept for the transition (empty on most workspaces). Full removal is deferred.
     pub session_entries: i64,
+    /// The raw-transcript session→code map (`session_edges`) — the live corpus
+    /// behind `find_session` and `recent_sessions`.
+    pub session_edges: i64,
     pub memory_entries: i64,
     pub design_doc_sections: i64,
     pub source_chunks: i64,
@@ -252,7 +282,7 @@ pub struct RecentSessionsRequest {
     #[serde(default)]
     pub filter: Option<String>,
 
-    /// Day window (defaults to 30) against `entry_date`.
+    /// Day window (defaults to 30) against each session's edit time (`edited_at`).
     #[serde(default)]
     pub days: Option<i64>,
 

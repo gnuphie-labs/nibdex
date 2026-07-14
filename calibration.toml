@@ -64,8 +64,11 @@ ai_read_ms_per_ktok = 0.0
 # ms credited per eliminated grep/open round-trip the by-hand search would cost.
 roundtrip_ms_per_call = 0.0
 
-# Locate-a-session counterfactual: Claude reads CLAUDE.md fully (~152 KB)
-# + greps memory dir to find the entry. §2.4 M1 baseline.
+# Locate-a-session counterfactual: to recover why/where a past edit was made,
+# the by-hand path reads CLAUDE.md fully (~152 KB) + greps transcripts/memory.
+# find_session now serves this from the session_edges map (file+rationale+commit),
+# not the empty session_entries table; the counterfactual size is unchanged.
+# PROVISIONAL — retune from a real export once session_edges has field data.
 [tools.find_session]
 counterfactual_tokens_p50 = 60000
 counterfactual_tokens_p95 = 85000

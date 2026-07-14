@@ -23,6 +23,10 @@ docs/*.pdf
 .env
 .env.*
 *.key
+
+# Per-user domain map (docs/SESSION_SCOPE_DESIGN.md §0) — a workspace-local file
+# naming the user's real domains/projects; never part of nibdex's own repo.
+.nibdex-domains.toml
 *.pem
 *.crt
 *.cer

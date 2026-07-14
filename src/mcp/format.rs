@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Result shaping: row→struct builders (`build_session_result`,
+//! Result shaping: row→struct builders (`build_session_edge_result`,
 //! `build_commit_result`), envelope finishers, and the small formatting
 //! helpers (`summarize`, `unix_to_iso`, `percentile`, `parse_json_array`).
 //! Relocated from `mcp.rs` by gh#6 (see `docs/MCP_SPLIT_PLAN.md`).
@@ -8,45 +8,66 @@
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 
-use super::types::{CommitResult, SUMMARY_CHAR_LIMIT, SessionResult, ToolEnvelope};
+use super::types::{CommitResult, SessionEdgeResult, ToolEnvelope};
 
-/// Row shape returned by `session_entries` queries: (session_number, entry_date,
-/// body, files_touched, todos_mentioned, decisions_made). Aliased to keep the
-/// 6-tuple manageable at the four call sites that share it.
-pub(crate) type SessionRow = (
-    i64,
-    Option<String>,
+/// Row shape returned by `session_edges` queries (rank passed separately, as with
+/// the other builders): (session_id, tool, file_path, repo_path, git_branch,
+/// edited_at, rationale, commit_hash_full, commit_summary).
+pub(crate) type SessionEdgeRow = (
+    String,
+    String,
     String,
     Option<String>,
+    Option<String>,
+    i64,
+    String,
     Option<String>,
     Option<String>,
 );
 
-pub(crate) fn build_session_result(row: SessionRow, rank: Option<f64>) -> SessionResult {
-    let (session_number, entry_date, body, files_touched, todos_mentioned, decisions_made) = row;
-    SessionResult {
-        session_number,
-        entry_date,
-        summary: summarize(&body, SUMMARY_CHAR_LIMIT),
-        body,
-        files_touched: parse_json_array(files_touched.as_deref()),
-        todos_mentioned: parse_json_array(todos_mentioned.as_deref()),
-        decisions_made: parse_json_array(decisions_made.as_deref()),
+pub(crate) fn build_session_edge_result(row: SessionEdgeRow, rank: Option<f64>) -> SessionEdgeResult {
+    let (
+        session_id,
+        tool,
+        file_path,
+        repo_path,
+        git_branch,
+        edited_at,
+        rationale,
+        commit_hash_full,
+        commit_summary,
+    ) = row;
+    let commit_hash = commit_hash_full
+        .as_ref()
+        .map(|h| h.chars().take(7).collect());
+    SessionEdgeResult {
+        session_id,
+        tool,
+        file_path,
+        repo_path,
+        git_branch,
+        edited_at_iso: unix_to_iso(edited_at),
+        edited_at_unix: edited_at,
+        rationale,
+        commit_hash,
+        commit_hash_full,
+        commit_summary,
         rank,
     }
 }
 
-pub(crate) fn finish_session_envelope(
-    results: Vec<SessionResult>,
+pub(crate) fn finish_session_edge_envelope(
+    results: Vec<SessionEdgeResult>,
     total: i64,
     tool: &str,
     query_broadened: bool,
-) -> ToolEnvelope<SessionResult> {
+) -> ToolEnvelope<SessionEdgeResult> {
     let returned = results.len() as i64;
-    // Session bodies are returned untrimmed, so the result body IS the full read
-    // size (chars ÷ 4, matching `token_estimate_from_serialized`).
+    // The by-hand counterfactual for a session edge is reading its rationale
+    // (the "why" the transcript preserves); that is the untrimmed read size
+    // (chars ÷ 4, matching `token_estimate_from_serialized`).
     let returned_full_tokens =
-        (results.iter().map(|r| r.body.chars().count()).sum::<usize>() / 4) as u64;
+        (results.iter().map(|r| r.rationale.chars().count()).sum::<usize>() / 4) as u64;
     ToolEnvelope {
         results,
         total_matched: total,

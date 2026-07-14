@@ -211,6 +211,64 @@ async fn seed_all(pool: &SqlitePool) {
     .execute(pool)
     .await
     .unwrap();
+
+    // session_edges (child table #7) — the raw-transcript session→code map that
+    // `find_session` now serves (punch-list #3). The rationales mirror the
+    // `session_entries` bodies above so the find_session query tests exercise the
+    // same term semantics (rustFetch / memory extractor / OR-broaden) against the
+    // new corpus. Seeded AFTER commit_entries so the `commit_id` FK resolves.
+    // Edge A is bound to commit 1 (the rustFetch commit, id 1) to exercise the
+    // provenance LEFT JOIN; edge B is unbound (commit_id NULL). FTS body =
+    // "rationale + file_path", kind='session_edge' — matching production
+    // (`session_index::insert_edge`).
+    // Distinct edited_at so recency ordering is testable: sess-618 is newest (now),
+    // sess-594 is 2 days old (still inside a 7-day window).
+    for (uuid, sid, tool, file, rationale, commit_id, edited_at) in [
+        (
+            "uuid-594-1",
+            "sess-594-formsvc",
+            "Write",
+            "src/formsvc.rs",
+            "formsvc-cf wedge recurrence; rustFetch FD leak diagnosis.",
+            Some(1_i64),
+            now - 2 * 86400,
+        ),
+        (
+            "uuid-618-1",
+            "sess-618-memory",
+            "Edit",
+            "src/extractor/memory.rs",
+            "Day 5 SHIPPED — memory extractor lands. bb8 mentioned once.",
+            None,
+            now,
+        ),
+    ] {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO session_edges \
+                (session_id, message_uuid, edge_ordinal, tool, file_path, repo_path, \
+                 git_branch, edited_at, rationale, commit_id) \
+             VALUES (?, ?, 0, ?, ?, '/tmp/webhooksvc', 'main', ?, ?, ?) RETURNING id",
+        )
+        .bind(sid)
+        .bind(uuid)
+        .bind(tool)
+        .bind(file)
+        .bind(edited_at)
+        .bind(rationale)
+        .bind(commit_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO search_index (body, kind, rowid_ref, source_table) \
+             VALUES (?, 'session_edge', ?, 'session_edges')",
+        )
+        .bind(format!("{rationale} {file}"))
+        .bind(row.0)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 // ---- find_session ---------------------------------------------------------------
@@ -234,8 +292,15 @@ async fn find_session_happy_path() {
     assert_eq!(envelope.tool, "find_session");
     assert_eq!(envelope.total_matched, 1);
     assert_eq!(envelope.returned, 1);
-    assert_eq!(envelope.results[0].session_number, 594);
-    assert!(envelope.results[0].rank.is_some());
+    let hit = &envelope.results[0];
+    assert_eq!(hit.session_id, "sess-594-formsvc");
+    assert_eq!(hit.file_path, "src/formsvc.rs");
+    assert_eq!(hit.tool, "Write");
+    // The provenance LEFT JOIN surfaced the capturing commit (edge A → commit 1).
+    assert_eq!(hit.commit_hash.as_deref(), Some("aaaaaaa"));
+    assert_eq!(hit.commit_hash_full.as_deref().map(str::len), Some(40));
+    assert!(hit.commit_summary.as_deref().unwrap().contains("rustFetch"));
+    assert!(hit.rank.is_some());
 }
 
 #[tokio::test]
@@ -282,8 +347,8 @@ async fn find_session_or_fallback_broadens_when_and_matches_nothing() {
     let pool = fresh_pool().await;
     seed_all(&pool).await;
 
-    // "memory" lives only in #618, "rustFetch" only in #594 — they never co-occur,
-    // so the implicit-AND query matches zero. The OR-fallback must rescue it.
+    // "memory" lives only in the sess-618 edge, "rustFetch" only in sess-594 — they
+    // never co-occur, so the implicit-AND query matches zero. OR-fallback rescues it.
     let envelope = run_find_session(
         &pool,
         &FindSessionRequest {
@@ -305,7 +370,7 @@ async fn find_session_does_not_broaden_when_and_already_matches() {
     let pool = fresh_pool().await;
     seed_all(&pool).await;
 
-    // Both terms co-occur in #618 → AND matches → no broadening.
+    // Both terms co-occur in the sess-618 edge → AND matches → no broadening.
     let envelope = run_find_session(
         &pool,
         &FindSessionRequest {
@@ -319,7 +384,9 @@ async fn find_session_does_not_broaden_when_and_already_matches() {
 
     assert!(!envelope.query_broadened);
     assert_eq!(envelope.total_matched, 1);
-    assert_eq!(envelope.results[0].session_number, 618);
+    assert_eq!(envelope.results[0].session_id, "sess-618-memory");
+    // This edge is unbound (commit_id NULL) — the LEFT JOIN yields no provenance.
+    assert!(envelope.results[0].commit_hash.is_none());
 }
 
 #[test]
@@ -995,8 +1062,8 @@ fn sanitize_fts5_quotes_only_parser_hostile_tokens() {
 
 #[tokio::test]
 async fn find_session_hyphenated_query_does_not_crash() {
-    // Pre-D-10.10 this crashed with `no such column: cf`. The seeded #594 body
-    // contains "formsvc-cf", so the sanitized phrase must match it.
+    // Pre-D-10.10 this crashed with `no such column: cf`. The seeded sess-594 edge
+    // rationale contains "formsvc-cf", so the sanitized phrase must match it.
     let pool = fresh_pool().await;
     seed_all(&pool).await;
     let envelope = run_find_session(
@@ -1010,7 +1077,7 @@ async fn find_session_hyphenated_query_does_not_crash() {
     .await
     .unwrap();
     assert_eq!(envelope.total_matched, 1);
-    assert_eq!(envelope.results[0].session_number, 594);
+    assert_eq!(envelope.results[0].session_id, "sess-594-formsvc");
 }
 
 #[tokio::test]
@@ -1266,32 +1333,40 @@ async fn find_design_doc_enforces_total_body_budget_across_results() {
     }
 }
 
-// ---- D-10.12: recent_sessions ordering ------------------------------------------
+// ---- recent_sessions ordering ---------------------------------------------------
 
 #[tokio::test]
-async fn recent_sessions_orders_by_session_number_not_body_date() {
-    // Regression for D-10.12: the higher session_number must sort first even when it
-    // has a NULL body-date and the lower one carries a (later-looking) parsed date.
+async fn recent_sessions_orders_by_edit_recency() {
+    // recent_sessions returns one representative row per session, most-recently-edited
+    // first, ordered by edited_at. (The old D-10.12 body-date-vs-session_number
+    // confound was a session_entries-only artifact; session_edges carry a real epoch.)
     let pool = fresh_pool().await;
-    sqlx::query(
-        "INSERT INTO documents (path, kind, content_hash, mtime, indexed_at) \
-         VALUES ('/tmp/CLAUDE.md', 'session_history', 'h', 0, 0)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    // #652 (newest) has no date in its body; #614 quotes a future-looking soak date.
-    for (sn, date, body) in [
-        (652i64, None::<&str>, "typeahead mouse-select fix shipped"),
-        (614i64, Some("2026-06-02"), "soak open through 2026-06-02"),
+    let now: i64 = sqlx::query_scalar("SELECT CAST(strftime('%s','now') AS INTEGER)")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for (uuid, sid, edited_at, rationale) in [
+        ("u-old", "sess-old", now - 5 * 86400, "older session touched auth"),
+        ("u-new", "sess-new", now - 86400, "newer session touched pool"),
     ] {
-        sqlx::query(
-            "INSERT INTO session_entries (document_id, session_number, entry_date, body) \
-             VALUES (1, ?, ?, ?)",
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO session_edges \
+                (session_id, message_uuid, edge_ordinal, tool, file_path, edited_at, rationale) \
+             VALUES (?, ?, 0, 'Edit', 'src/x.rs', ?, ?) RETURNING id",
         )
-        .bind(sn)
-        .bind(date)
-        .bind(body)
+        .bind(sid)
+        .bind(uuid)
+        .bind(edited_at)
+        .bind(rationale)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO search_index (body, kind, rowid_ref, source_table) \
+             VALUES (?, 'session_edge', ?, 'session_edges')",
+        )
+        .bind(rationale)
+        .bind(row.0)
         .execute(&pool)
         .await
         .unwrap();
@@ -1303,10 +1378,10 @@ async fn recent_sessions_orders_by_session_number_not_body_date() {
         .unwrap();
     assert_eq!(envelope.results.len(), 2);
     assert_eq!(
-        envelope.results[0].session_number, 652,
-        "newest session_number must lead despite NULL body-date"
+        envelope.results[0].session_id, "sess-new",
+        "most-recent edit must lead"
     );
-    assert_eq!(envelope.results[1].session_number, 614);
+    assert_eq!(envelope.results[1].session_id, "sess-old");
 }
 
 // ---- check() --------------------------------------------------------------------
@@ -1324,11 +1399,13 @@ async fn check_returns_d633_envelope() {
 
     // Indexer counts must reflect seed data.
     assert_eq!(result.indexer.session_entries, 2);
+    assert_eq!(result.indexer.session_edges, 2);
     assert_eq!(result.indexer.memory_entries, 1);
     assert_eq!(result.indexer.design_doc_sections, 1);
     assert_eq!(result.indexer.commit_entries, 2);
     assert_eq!(result.indexer.indexed_repos, 2);
-    assert_eq!(result.indexer.search_index_total, 6);
+    // 2 session_entries + 1 memory + 1 design + 2 commits + 2 session_edges.
+    assert_eq!(result.indexer.search_index_total, 8);
     assert_eq!(result.indexer.documents.get("session_history"), Some(&1));
     assert_eq!(result.indexer.documents.get("memory"), Some(&1));
     assert_eq!(result.indexer.documents.get("design_doc"), Some(&1));
@@ -1592,7 +1669,7 @@ async fn recent_sessions_happy_path_filter_match() {
     let envelope = run_recent_sessions(&pool, &req, &mut Stages::default()).await.unwrap();
     assert_eq!(envelope.tool, "recent_sessions");
     assert_eq!(envelope.total_matched, 1);
-    assert_eq!(envelope.results[0].session_number, 594);
+    assert_eq!(envelope.results[0].session_id, "sess-594-formsvc");
 }
 
 #[tokio::test]
@@ -1616,16 +1693,17 @@ async fn recent_sessions_invalid_fts5_errors() {
 }
 
 #[tokio::test]
-async fn recent_sessions_no_filter_orders_by_session_number_desc() {
+async fn recent_sessions_no_filter_orders_by_edit_recency_desc() {
     let pool = fresh_pool().await;
     seed_all(&pool).await;
 
     let req = make_rs_request(None, Some(30), Some(10));
     let envelope = run_recent_sessions(&pool, &req, &mut Stages::default()).await.unwrap();
-    // Both seed entries within window.
+    // Two distinct sessions within the window; the newer edit (sess-618, now) leads
+    // the older (sess-594, 2 days ago). Recency ordering carries no bm25 rank.
     assert_eq!(envelope.total_matched, 2);
-    assert_eq!(envelope.results[0].session_number, 618);
-    assert_eq!(envelope.results[1].session_number, 594);
+    assert_eq!(envelope.results[0].session_id, "sess-618-memory");
+    assert_eq!(envelope.results[1].session_id, "sess-594-formsvc");
     assert!(envelope.results[0].rank.is_none());
 }
 

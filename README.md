@@ -101,35 +101,35 @@ Seven query tools plus `check()`:
 | `find_commit` | FTS5 search over commit messages across indexed repos | ranked commits with full SHA + author + body + files_changed |
 | `find_design_doc` | FTS5 search over design-doc `#` sections | ranked sections with heading path + line range + body |
 | `find_memory` | FTS5 search over memory files (`~/.claude/projects/.../memory/`) | ranked memory entries with name + type + description + body |
-| `find_session` | FTS5 search over CLAUDE.md session entries (see the format note below) | ranked sessions with `files_touched`, `todos_mentioned`, `decisions_made` |
+| `find_session` | FTS5 search over the session→code map (Edit/Write actions recovered from Claude Code transcripts) | ranked edits with file + rationale + capturing commit |
 | `recent_commits` | Recency view across all indexed repos | commits ordered by `authored_at_unix DESC` |
-| `recent_sessions` | Recency view (filter by file optional) | sessions ordered by `entry_date DESC` |
+| `recent_sessions` | Recency view over sessions (optional FTS filter) | one representative row per session — its most-recent edit — ordered by latest edit |
 | `check` | Index health, perf p50/p95, cost-savings rollup | structured snapshot for ops |
 
 Query parameters take raw SQLite FTS5 `MATCH` syntax (no NL translation — see LIMITATIONS §2 for the hyphen-as-NOT gotcha and the workaround).
 
-## `find_session` and the CLAUDE.md format (the narrow one)
+## `find_session`, `recent_sessions`, and the session→code map
 
-`find_session` is the most limited of the tools, and worth being upfront about. It parses session entries from CLAUDE.md files that follow **one specific shape** (below). A CLAUDE.md in any other shape is still discovered and watched, but contributes nothing to the session corpus — so on most workspaces `find_session` starts out empty. The other four `find_*` tools — `find_code`, `find_commit`, `find_memory`, `find_design_doc` — work regardless of CLAUDE.md shape, which is why the quickstart leads with `find_code`. A transcript-based session index that doesn't depend on this format is the Phase-1b plan (see [roadmap](#roadmap)).
+`find_session` and `recent_sessions` search the **session→code map**: every `Edit` and `Write` nibdex recovers from your Claude Code transcripts (`~/.claude/projects/`), each stored with the file it touched, the assistant rationale that explained it, and the commit that later captured it. So you can ask "which session worked out the retry logic?" and get the actual edits back — matched by their *reasoning*, not just a filename — each pointing at its file and provenance commit. `find_session` ranks by relevance; `recent_sessions` returns one representative row per session (its most-recent edit), most-recently-active first.
 
-**Expected shape:**
+This corpus is built by a separate step — `nibdex index-sessions --all-slugs --db nibdex.db` — because it reads your Claude Code transcripts, not the repo; `nibdex index` alone leaves it empty, so run `index-sessions` too (or `find_session` stays empty).
 
-```markdown
-## Recent session history
+Two honest caveats specific to this corpus:
 
-- **#100**: Did the thing on 2026-05-27. TODO #042 CLOSED.
-  Touched src/foo.rs and src/bar.rs.
-- **#099**: Previous thing on 2026-05-26.
-- **#098–#095**: Range entry — parsed by the first number, body preserves the marker.
-```
+- **It's inherently your-machine-specific.** The source is your own transcripts, so unlike `find_code`/`find_commit` (which work against any clone), `find_session` can't be reproduced from a fresh checkout — there's nothing to clone. [`docs/EXAMPLES.md`](docs/EXAMPLES.md) shows the shape against the author's own history.
+- **Recall starts at first index and grows forward.** Claude Code prunes old transcripts (~30 days by default), so nibdex indexes them additively: once an edit is captured it's kept, but edits from before you first indexed — whose transcripts have since rotated out — can't be recovered.
 
-**Required:**
-- A `## Recent session history` heading (case-insensitive on `R`).
-- Entries as `- **#<N>**:` bullets — single number or `#N–#M` / `#N-#M` range.
+If you work across multiple clients or employers on one machine, this is the corpus most likely to mix them — see [Separating IP domains](#separating-ip-domains-optional) below.
 
-**Extracted per entry:** entry date (first `20YY-MM-DD`), files mentioned by extension that resolve under the workspace, TODO refs (`TODO #NNN`), decisions (`CLOSED`, `SHIPPED`, `LOCKED`, `FILED`).
+> **Legacy CLAUDE.md session format.** Earlier nibdex parsed session entries from a specific `## Recent session history` CLAUDE.md shape. That corpus is still extracted but **no longer queried** — the transcript map above replaces it — and it will be removed in a future release.
 
-When `nibdex index` finds a CLAUDE.md and extracts 0 entries, it prints a one-line note classifying *why*: looks like a static project README, uses a different session-tracking convention (lists the headings it saw), or has the right heading but mismatched bullet shape. Pluggable format presets are a Phase 1b candidate (see [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §6.1).
+## Separating IP domains (optional)
+
+If you keep more than one client's or employer's code on the same machine, nibdex can index each into its own database, so a query against one never surfaces another's code, commits, or session reasoning. You label your top-level subdirectories in a `.nibdex-domains.toml`, build one database per domain with `--domain`, and run one query server per database — each opens only its own file, so a domain's content is *physically absent* from the others' index rather than filtered out of results.
+
+The guarantee is mechanical and needle-tested: a domain's database never contains another domain's files, commits, or session edits, nor the reasoning from a session that read or edited another domain's files (with a disclosed gap for tools that don't name a path, like `Bash` — see the guide). It is deliberately **not** an OS-level vault — nibdex keeps its *own* index from commingling domains, but can't police the rest of your machine; if you need a harder boundary the honest answer is separate accounts or machines. The full rationale, mechanism, and honest limits are in [`docs/IP_DOMAINS.md`](docs/IP_DOMAINS.md), with the security posture in [`SECURITY.md`](SECURITY.md).
+
+This is off by default: with no `.nibdex-domains.toml`, nibdex indexes your whole workspace into one database exactly as before.
 
 ## Security & privacy
 
@@ -158,10 +158,12 @@ A **planned, opt-in** `nibdex metrics-export` will let you *voluntarily* share a
 
 The phased differentiator list from [DESIGN §4](docs/DESIGN.md#4-differentiators-phased) maps to the version progression in [`docs/VERSIONING.md`](docs/VERSIONING.md):
 
-- **Phase 1a (current, `0.1.x`)** — D2 (structured workspace history: session + git commits + memory + design docs) + **D1a (source-code indexing with commit-anchored provenance — `find_code`)** + D0 (always-available local daemon with file-watcher incremental indexing).
-- **Phase 1b (`0.2.x`)** — the D1 tail: live working-tree freshness, a transcript-based session index (replacing the CLAUDE.md-format dependency noted above), tree-sitter-aware code chunking, and D3 (richer MCP wrapping).
+- **Phase 1a (`0.1.x`)** — D2 (structured workspace history: session + git commits + memory + design docs) + **D1a (source-code indexing with commit-anchored provenance — `find_code`)** + D0 (always-available local daemon with file-watcher incremental indexing).
+- **Phase 1b (current, `0.2.x`)** — the D1 tail: live working-tree freshness, tree-sitter-aware code chunking, and D3 (richer MCP wrapping). *(The transcript-based session index that replaced the CLAUDE.md-format dependency has **landed** — `find_session`/`recent_sessions` read it now.)*
 - **Phase 2 (`0.3.x` – `0.5.x`)** — D4 (derived graph from tree-sitter + regex + commit co-occurrence), D5 (provenance metadata), D6 (source-change cache invalidation).
 - **Phase 3 (`0.6.x` – `0.9.x`)** — D7 (provenance-aware answer cache), D8 (local semantic search fallback), D9 (PG harness as alternative storage backend).
+
+**Cross-cutting — now shipped:** the [IP-domain partition](#separating-ip-domains-optional) is an isolation capability that spans every corpus, **orthogonal** to the D0–D9 retrieval lanes — it changes *which database content goes into*, not what gets retrieved. It is the headline of the `0.2.x` line.
 
 Phases are not promises with dates. The lane order is the commitment; the per-phase shape gets revised as dogfood surfaces what matters.
 

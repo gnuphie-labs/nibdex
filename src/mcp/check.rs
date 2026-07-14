@@ -86,6 +86,9 @@ async fn compute_indexer_counts(pool: &SqlitePool) -> Result<IndexerCounts> {
     let (session_entries,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_entries")
         .fetch_one(pool)
         .await?;
+    let (session_edges,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_edges")
+        .fetch_one(pool)
+        .await?;
     let (memory_entries,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_entries")
         .fetch_one(pool)
         .await?;
@@ -108,6 +111,7 @@ async fn compute_indexer_counts(pool: &SqlitePool) -> Result<IndexerCounts> {
     Ok(IndexerCounts {
         documents,
         session_entries,
+        session_edges,
         memory_entries,
         design_doc_sections,
         source_chunks,
