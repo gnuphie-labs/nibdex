@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod audit;
 mod build_info;
 mod calibration;
 mod cli;
@@ -11,6 +12,7 @@ mod diff_index;
 mod domains;
 mod extractor;
 mod hash;
+mod hook;
 mod http_server;
 mod indexer;
 mod mcp;
@@ -20,6 +22,7 @@ mod metrics_sink;
 mod rescore;
 mod session_index;
 mod source_index;
+mod triage;
 mod symbol_index;
 mod thread_metric;
 mod watcher;
@@ -37,9 +40,15 @@ use crate::metrics_sink::{MetricsSink, MetricsSinkSpec};
 async fn main() -> Result<()> {
     let args = cli::Args::parse();
     match args.command {
+        cli::Command::Hook => {
+            // Never returns; every path exits 0 so a hook failure can never
+            // break the caller's own search.
+            hook::run().await;
+        }
         cli::Command::Index {
             workspace,
             memory_dir,
+            projects_dir,
             db,
             git_max_depth,
             include_nested_repos,
@@ -62,10 +71,15 @@ async fn main() -> Result<()> {
                 },
                 max_commits_per_repo,
             };
+            // Canonicalize so `documents.path` for memory files is absolute: a
+            // relative `--memory-dir ./mem` used to be stored relative and then
+            // read as "missing" by `check()` from any other cwd — false orphans.
+            let memory_dir = memory_dir.map(|m| m.canonicalize().unwrap_or(m));
             let stats = indexer::full_scan(
                 &pool,
                 &workspace,
                 memory_dir.as_deref(),
+                projects_dir.as_deref(),
                 git_opts,
                 domain.as_deref(),
             )
@@ -127,6 +141,14 @@ async fn main() -> Result<()> {
                         println!("no code hits for {query:?}");
                     } else {
                         println!("{} hit(s) for {query:?}:\n", hits.len());
+                        // `path` is repo-relative, so name the repo when the index
+                        // spans more than one — otherwise the hit is not openable.
+                        let repos: std::collections::BTreeSet<&str> =
+                            hits.iter().filter_map(|h| h.repo_path.as_deref()).collect();
+                        if repos.len() > 1 {
+                            println!("  spanning {} repos: {}\n", repos.len(),
+                                     repos.iter().copied().collect::<Vec<_>>().join(", "));
+                        }
                         for (i, h) in hits.iter().enumerate() {
                             let lang = h.language.as_deref().unwrap_or("?");
                             // Freshness gate: flag any non-verified location loudly
@@ -221,6 +243,7 @@ async fn main() -> Result<()> {
         cli::Command::IndexSessions {
             projects_dir,
             slug,
+            workspace_scoped,
             all_slugs,
             rebuild,
             workspace,
@@ -233,12 +256,16 @@ async fn main() -> Result<()> {
             };
             // Fail-narrow: scope MUST be explicit so a run never silently pulls
             // transcripts from another workspace / IP domain (SESSION_SCOPE_DESIGN §2).
-            let scope: Option<&str> = match (slug.as_deref(), all_slugs) {
-                (Some(_), true) => anyhow::bail!("pass either --slug <s> or --all-slugs, not both"),
-                (Some(s), false) => Some(s),
-                (None, true) => None,
-                (None, false) => anyhow::bail!(
-                    "scope required: --slug <s> for one workspace, or --all-slugs for machine-global"
+            let scope = match (slug.as_deref(), workspace_scoped, all_slugs) {
+                (None, false, false) => anyhow::bail!(
+                    "scope required: --workspace-scoped for this workspace's sessions, \
+                     --slug=<s> for one slug dir, or --all-slugs for machine-global"
+                ),
+                (Some(s), false, false) => session_index::SessionScope::Slug(s),
+                (None, true, false) => session_index::SessionScope::Workspace,
+                (None, false, true) => session_index::SessionScope::AllSlugs,
+                _ => anyhow::bail!(
+                    "pass exactly ONE of --workspace-scoped, --slug=<s>, or --all-slugs"
                 ),
             };
             let workspace = workspace.unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -263,10 +290,31 @@ async fn main() -> Result<()> {
                 stats.transcripts_seen,
                 stats.elapsed_ms
             );
-            if stats.edges_duplicate > 0 || stats.edges_skipped_no_uuid > 0 {
+            if stats.edges_duplicate > 0
+                || stats.edges_skipped_no_uuid > 0
+                || stats.edges_skipped_no_timestamp > 0
+            {
                 println!(
-                    "  merge: {} already indexed (skipped), {} skipped (no message uuid)",
-                    stats.edges_duplicate, stats.edges_skipped_no_uuid
+                    "  merge: {} already indexed (skipped), {} skipped (no message uuid), {} skipped (no timestamp)",
+                    stats.edges_duplicate,
+                    stats.edges_skipped_no_uuid,
+                    stats.edges_skipped_no_timestamp
+                );
+            }
+            if stats.edges_late_bound > 0 {
+                println!(
+                    "  late binding: {} previously-unbound edge(s) acquired their capturing commit",
+                    stats.edges_late_bound
+                );
+            }
+            // Same silent-zero this release is closing on the query side: without
+            // this line a permissions problem under the transcript root reads as
+            // "0 write-edge(s)" with no hint that anything was skipped.
+            if stats.transcripts_unreadable > 0 {
+                println!(
+                    "  skipped: {} transcript(s) could not be read (permissions, non-UTF-8, \
+                     or pruned mid-scan)",
+                    stats.transcripts_unreadable
                 );
             }
             println!(
@@ -281,6 +329,15 @@ async fn main() -> Result<()> {
                     domain.as_deref().unwrap_or(""),
                     stats.edges_dropped_foreign_domain,
                     stats.rationales_withheld
+                );
+            }
+            if workspace_scoped {
+                println!(
+                    "  workspace scope [{}]: {} edge(s) dropped (foreign session), \
+                     {} dropped (in-workspace session wrote outside)",
+                    workspace.display(),
+                    stats.edges_dropped_foreign_workspace,
+                    stats.edges_dropped_foreign_target
                 );
             }
             if stats.lines_parse_err > 0 {
@@ -342,6 +399,24 @@ async fn main() -> Result<()> {
             metrics_sink,
             calibration_toml,
         } => {
+            // A query server must not manufacture its own corpus. `db::open`
+            // creates a missing file and migrates it, so a typo'd or
+            // cwd-relative `--db` in an `.mcp.json` used to yield a permanently
+            // empty index that answered `corpus_empty: true` to everything with
+            // no other symptom (RC1 review 1.7). Refuse instead: the fix is one
+            // path away and the error names it.
+            if !db.exists() {
+                anyhow::bail!(
+                    "nibdex mcp: no index at {} (resolved from cwd {}). Run \
+                     `nibdex index --db <path>` first, or pass the same --db path \
+                     you indexed to. Refusing to create an empty database here, \
+                     because it would answer every query with an empty result.",
+                    db.display(),
+                    std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "?".to_string()),
+                );
+            }
             let pool = db::open(&db).await?;
             reconcile_cost_ledger(&pool, &metrics_sink).await;
             let sink = resolve_metrics_sink(metrics_sink)?;
@@ -354,6 +429,7 @@ async fn main() -> Result<()> {
             db,
             git_max_depth,
             include_nested_repos,
+            max_commits_per_repo,
         } => {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
             let pool = db::open(&db).await?;
@@ -371,7 +447,13 @@ async fn main() -> Result<()> {
             for sub in &subscriptions {
                 eprintln!("  watching {}", sub.watch_path().display());
             }
-            watcher::serve(pool, subscriptions, shutdown_rx).await?;
+            watcher::serve_with(
+                pool,
+                subscriptions,
+                shutdown_rx,
+                watcher::WatcherConfig { max_commits_per_repo },
+            )
+            .await?;
             eprintln!("nibdex watch — exited.");
         }
         cli::Command::Serve {
@@ -383,13 +465,40 @@ async fn main() -> Result<()> {
             calibration_toml,
             git_max_depth,
             include_nested_repos,
+            max_commits_per_repo,
         } => {
             let workspace = workspace.unwrap_or(std::env::current_dir()?);
+            // Loopback gate FIRST — before the db is opened or the watcher spawned.
+            // `http_server::serve` re-checks, but by then the watcher had already
+            // registered FS watches and written `file_watcher_state`, then hung
+            // for the 2 s drain (RC1 review, sev-2). A refused bind must be inert.
+            if !http.ip().is_loopback() {
+                anyhow::bail!(
+                    "nibdex serve: bind address {http} is not loopback. D-6.4.3 \
+                     requires 127.0.0.1 / [::1] at MVP."
+                );
+            }
+            // The watcher is not domain-aware: it re-indexes every repo it discovers
+            // into whatever db it holds. Say so when a domains file is present, since
+            // pointing this at a per-domain db silently breaks the partition
+            // (docs/IP_DOMAINS.md "Domain databases are index-only").
+            if workspace.join(".nibdex-domains.toml").exists() {
+                eprintln!(
+                    "[nibdex serve] warning: {} has a .nibdex-domains.toml, but the \
+                     file-watching daemon is not domain-aware — it re-indexes every \
+                     discovered repo into {}. Do NOT point it at a per-domain database; \
+                     query those with `nibdex mcp --db <domain.db>` and refresh with \
+                     `nibdex index --domain <name>`.",
+                    workspace.display(),
+                    db.display()
+                );
+            }
             let pool = db::open(&db).await?;
             reconcile_cost_ledger(&pool, &metrics_sink).await;
             let sink = resolve_metrics_sink(metrics_sink)?;
             let calibration = resolve_calibration(&calibration_toml);
             let git_opts = subscription_git_opts(git_max_depth, include_nested_repos);
+            let memory_dir = memory_dir.map(|m| m.canonicalize().unwrap_or(m));
             let subscriptions = resolve_subscriptions(&workspace, memory_dir.as_deref(), git_opts)?;
 
             // One outer shutdown signal fans out to watcher + HTTP server via
@@ -413,7 +522,13 @@ async fn main() -> Result<()> {
 
             let watcher_pool = pool.clone();
             let watcher_handle = tokio::spawn(async move {
-                watcher::serve(watcher_pool, subscriptions, watcher_rx).await
+                watcher::serve_with(
+                    watcher_pool,
+                    subscriptions,
+                    watcher_rx,
+                    watcher::WatcherConfig { max_commits_per_repo },
+                )
+                .await
             });
 
             let http_result = http_server::serve(pool, http, http_rx, sink, calibration).await;
@@ -469,6 +584,140 @@ async fn main() -> Result<()> {
                 }
             };
             println!("{}", serde_json::to_string_pretty(&snippet)?);
+        }
+        cli::Command::Audit {
+            workspace,
+            domain,
+            db,
+            config_only,
+            json,
+            triage,
+            stage_undecided,
+        } => {
+            let pool = db::open(&db).await?;
+            let report = audit::run(&pool, &workspace, &domain, config_only).await?;
+            let ws_c = workspace.canonicalize()?;
+            let loaded = domains::DomainConfig::load(&ws_c)?;
+            let pending = loaded
+                .as_ref()
+                .map(|c| triage::unassigned_subdirs(c, &ws_c))
+                .unwrap_or_default();
+            let staged: Vec<String> =
+                loaded.as_ref().map(|c| c.undecided().to_vec()).unwrap_or_default();
+            if json {
+                println!("{}", audit::render_json(&report, &pending, &staged));
+            } else {
+                print!("{}", audit::render(&report));
+            }
+
+            if stage_undecided {
+                let ws = &ws_c;
+                let cfg = loaded.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("no .nibdex-domains.toml at {}", ws.display())
+                })?;
+                let decisions = triage::stage_undecided(cfg, &pending);
+                if decisions.is_empty() {
+                    println!(
+                        "\nStaging: nothing new — every subdirectory is labeled, \
+                         acknowledged, or already in `undecided`."
+                    );
+                } else {
+                    println!("\nPlanned change to {}:", triage::config_path(ws).display());
+                    print!("{}", triage::render_plan(&decisions, cfg.undecided()));
+                    let n = triage::apply(ws, &decisions)?;
+                    println!(
+                        "\nStaged {n} subdirector{} in [unassigned] undecided.\n\
+                         Decide by editing {} — move each entry into a domain's list \
+                         under [domains],\nor into `acknowledged`. Re-index the affected \
+                         domain(s) afterwards.",
+                        if n == 1 { "y" } else { "ies" },
+                        triage::config_path(ws).display()
+                    );
+                }
+            }
+
+            if triage {
+                let ws = ws_c;
+                let cfg = domains::DomainConfig::load(&ws)?
+                    .ok_or_else(|| anyhow::anyhow!("no .nibdex-domains.toml at {}", ws.display()))?;
+                if pending.is_empty() {
+                    println!("\nTriage: nothing unassigned. Every subdirectory has a decision.");
+                } else if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    // Never prompt into a pipe: an unread prompt answered by
+                    // stray input could label a directory for the wrong domain.
+                    println!(
+                        "\nTriage needs a terminal ({} subdir(s) pending). Re-run interactively.",
+                        pending.len()
+                    );
+                } else {
+                    let names = cfg.domain_names();
+                    let stdin = std::io::stdin();
+                    let mut lock = stdin.lock();
+                    let mut out = std::io::stdout();
+                    let decisions =
+                        triage::run_triage(&ws, &pending, &names, &mut lock, &mut out)?;
+
+                    println!("\nPlanned change to {}:", triage::config_path(&ws).display());
+                    print!("{}", triage::render_plan(&decisions, cfg.undecided()));
+                    print!("\nApply? [y/N] ");
+                    use std::io::Write as _;
+                    std::io::stdout().flush()?;
+                    let mut answer = String::new();
+                    std::io::BufRead::read_line(&mut lock, &mut answer)?;
+                    if answer.trim().eq_ignore_ascii_case("y") {
+                        let n = triage::apply(&ws, &decisions)?;
+                        println!("Applied {n} change(s). Re-index the affected domain(s).");
+                    } else {
+                        println!("Nothing written.");
+                    }
+                }
+            }
+            // Exit non-zero only on ERROR-severity findings: config that cannot
+            // work as written. WARN/INFO are for a human to weigh, not for a
+            // script to fail on.
+            if report.worst() == Some(audit::Severity::Error) {
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Label {
+            subdir,
+            domain,
+            acknowledge,
+            workspace,
+            dry_run,
+        } => {
+            let ws = workspace.canonicalize()?;
+            // Take a domain; never derive one. Requiring an explicit choice is
+            // the whole safety property — the command IS the confirmation that
+            // the interactive path gets from shown-and-confirmed.
+            let decision = if acknowledge {
+                triage::Decision::Acknowledge
+            } else if domain.is_empty() {
+                anyhow::bail!(
+                    "pass --domain <name> (repeat to share across domains) or --acknowledge; \
+                     nibdex will not choose a domain for you"
+                );
+            } else {
+                triage::Decision::Label(domain)
+            };
+            let decisions = vec![(subdir.clone(), decision)];
+            // Load the config purely so the plan can show a `undecided` entry
+            // being retired alongside the decision that retires it.
+            let staged: Vec<String> = domains::DomainConfig::load(&ws)?
+                .map(|c| c.undecided().to_vec())
+                .unwrap_or_default();
+            println!("Planned change to {}:", triage::config_path(&ws).display());
+            print!("{}", triage::render_plan(&decisions, &staged));
+            if dry_run {
+                println!("\n--dry-run: nothing written.");
+            } else {
+                let n = triage::apply(&ws, &decisions)?;
+                if n == 0 {
+                    println!("\nAlready recorded; nothing to do.");
+                } else {
+                    println!("\nApplied {n} change(s). Re-index the affected domain(s).");
+                }
+            }
         }
         cli::Command::MetricsExport {
             metrics_jsonl,
@@ -738,7 +987,7 @@ fn print_summary(
         stats.session_entries, stats.extract_session_history_ms
     );
     println!(
-        "  memory_entries: {} ({} skipped no-frontmatter) (extract.memory {}ms)",
+        "  memory_entries: {} ({} skipped: no frontmatter, or frontmatter without name/type) (extract.memory {}ms)",
         stats.memory_entries, stats.memory_skipped_no_frontmatter, stats.extract_memory_ms
     );
     println!(
@@ -754,12 +1003,45 @@ fn print_summary(
         stats.extract_commits_ms,
     );
     println!(
-        "  source: {} chunk(s) across {} file(s) ({} skipped to design/session) (extract.source {}ms)",
+        "  source: {} chunk(s) across {} file(s) ({} skipped to design/session, {} pruned: no longer tracked) (extract.source {}ms)",
         stats.source_chunks,
         stats.source_files,
         stats.source_skipped_other_corpus,
+        stats.source_files_pruned,
         stats.extract_source_ms,
     );
+    println!(
+        "  session_edges: {} new, {} already indexed, across {} transcript(s) \
+         ({} dropped: foreign session, {} dropped: in-workspace session wrote outside, \
+         {} skipped: no timestamp) (extract.session_edges {}ms)",
+        stats.session_edges,
+        stats.session_edges_already_indexed,
+        stats.session_transcripts,
+        stats.session_edges_dropped_foreign_workspace,
+        stats.session_edges_dropped_foreign_target,
+        stats.session_edges_skipped_no_timestamp,
+        stats.extract_session_edges_ms,
+    );
+    if stats.session_edges_late_bound > 0 {
+        println!(
+            "    {} previously-unbound edge(s) acquired their capturing commit",
+            stats.session_edges_late_bound
+        );
+    }
+    if stats.session_transcripts_unreadable > 0 {
+        println!(
+            "    note: {} transcript(s) could not be read and were skipped \
+             (permissions, non-UTF-8, or pruned mid-scan) — the rest indexed normally",
+            stats.session_transcripts_unreadable
+        );
+    }
+    if let Some(err) = &stats.session_index_error {
+        println!(
+            "    WARNING: the session pass failed, so `find_session` may be stale or empty.\n\
+             \x20             The other five corpora above indexed normally.\n\
+             \x20             Reason: {err}"
+        );
+    }
     print_delta("indexer.full_scan", stats.elapsed_ms as i64, prior_scan);
     print_delta(
         "extract.session_history",

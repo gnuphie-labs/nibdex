@@ -58,8 +58,38 @@ pub struct ToolEnvelope<T> {
     /// automatically retried it OR-broadened (D-10.13). Present only when broadening
     /// fired, so the caller knows these results are a relevance net cast wider than
     /// what they literally asked for.
-    #[serde(skip_serializing_if = "is_false")]
+    ///
+    /// ⚠️ `#[serde(default)]` is load-bearing, not decoration. `schemars` derives
+    /// `required` from the Rust type, so a bare `bool` is advertised as mandatory
+    /// and then dropped by `skip_serializing_if` on every response where broadening
+    /// did NOT fire — which is nearly all of them. That made 7 of 8 tools violate
+    /// their own `outputSchema` on ordinary successful calls. `default` is what
+    /// tells schemars the field is omissible, and it states the true semantics:
+    /// absent means false. Same class as `retired_corpora` below; gated by
+    /// `envelope_emits_every_field_its_schema_requires`.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub query_broadened: bool,
+    /// Why `results` is empty — present ONLY on a zero-result response, because
+    /// that is the only time the caller cannot tell the two cases apart.
+    ///
+    /// `false` = the corpus holds rows, the query simply matched none of them.
+    /// `true` = the corpus is EMPTY, so no query could have matched. An empty
+    /// result is then a statement about the index, not about the codebase, and a
+    /// caller that reads it as "this workspace has no such thing" is being misled
+    /// by silence. Same reasoning as `query_broadened`: when nibdex quietly does
+    /// something other than what the caller assumed, it says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_empty: Option<bool>,
+    /// The newest item this corpus contains, ISO-8601 — the answer to "is what I
+    /// searched current?". Present alongside `corpus_empty` on a zero-result
+    /// response when the corpus is non-empty.
+    ///
+    /// ONE meaning across all five corpora: the most recent thing in there, as of
+    /// the last index — newest edit, newest commit, newest file modification.
+    /// Never "when nibdex last ran", which is a different question and mixing the
+    /// two makes the field untrustworthy for either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_indexed_through: Option<String>,
     /// Summed FULL (untruncated) token estimate of the hits in `results`, before
     /// any snippet/body-budget trimming — the "what you'd have read by hand once
     /// located" size. This is the Phase-1 raw input for the grounded
@@ -75,6 +105,65 @@ pub struct ToolEnvelope<T> {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Which corpus a `find_*`/`recent_*` tool searched — the input to the
+/// zero-result diagnosis (`corpus_empty` / `corpus_indexed_through`).
+///
+/// Each variant names its table and the clock for "the newest thing in here".
+/// Where the corpus stores its own content time (an edit, a commit) that is the
+/// answer; where it does not, the owning document's `mtime` is — the newest
+/// source/doc/memory file the index holds.
+///
+/// ⚠️ NOT `documents.indexed_at`, which looks like the obvious choice and is
+/// wrong. The write-amplification fix deliberately skips unchanged files without
+/// refreshing `indexed_at`, so a repo whose source has not changed in two months
+/// reports a two-month-old stamp on a freshly-built index — telling the caller
+/// their index is stale when it is current, which is the same misdiagnosis this
+/// whole field exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Corpus {
+    SessionEdges,
+    CommitEntries,
+    DesignDocSections,
+    MemoryEntries,
+    SourceChunks,
+}
+
+impl Corpus {
+    /// `(count-query, newest-item-query)`. The second returns a unix timestamp.
+    pub(crate) fn probe_sql(self) -> (&'static str, &'static str) {
+        match self {
+            Corpus::SessionEdges => (
+                "SELECT COUNT(*) FROM session_edges",
+                "SELECT MAX(edited_at) FROM session_edges",
+            ),
+            // `committed_at`, NOT `authored_at`. The author date is caller-supplied
+            // (`git commit --date`) and is PRESERVED across a rebase, so it says when
+            // the work was written, not when this history came to hold it. Two ways
+            // that breaks a freshness answer: a future-dated commit makes the corpus
+            // claim permanently-future content, and the ordinary case — a rebased or
+            // cherry-picked branch — reports a freshly-indexed corpus as weeks stale.
+            // The committer date is stamped by git when the object is written, which
+            // is the question this field asks.
+            Corpus::CommitEntries => (
+                "SELECT COUNT(*) FROM commit_entries",
+                "SELECT MAX(committed_at) FROM commit_entries",
+            ),
+            Corpus::DesignDocSections => (
+                "SELECT COUNT(*) FROM design_doc_sections",
+                "SELECT MAX(mtime) FROM documents WHERE kind = 'design_doc'",
+            ),
+            Corpus::MemoryEntries => (
+                "SELECT COUNT(*) FROM memory_entries",
+                "SELECT MAX(mtime) FROM documents WHERE kind = 'memory'",
+            ),
+            Corpus::SourceChunks => (
+                "SELECT COUNT(*) FROM source_chunks",
+                "SELECT MAX(mtime) FROM documents WHERE kind = 'source'",
+            ),
+        }
+    }
 }
 
 /// One session→code edge (Gear 7/8): a single Edit/Write tool-call recovered
@@ -148,43 +237,58 @@ pub struct DesignDocResult {
     pub heading_path: String,
     pub line_start: i64,
     pub line_end: i64,
-    /// Section body, bounded to `DESIGN_DOC_BODY_CHAR_LIMIT` chars (and omitted once the
-    /// per-call total-body budget is spent). When bounded, `body_truncated` is true —
-    /// use `doc_path` + `line_start`/`line_end` to read the full section.
+    /// A MATCH-centered window of the section (FTS5 `snippet`, ≤64 tokens), further
+    /// bounded to `DESIGN_DOC_BODY_CHAR_LIMIT` chars and omitted once the per-call
+    /// total-body budget is spent. NOT the whole section: any section longer than the
+    /// window comes back with `body_truncated: true` — use `doc_path` +
+    /// `line_start`/`line_end` to read it in full.
     pub body: String,
     /// First 200 chars of body, word-boundary truncated.
     pub body_excerpt: String,
     /// True when `body` was capped or omitted by the D-10.11 budget (full text lives at
     /// `doc_path` lines `line_start`..=`line_end`).
     pub body_truncated: bool,
-    /// D-10.16: the exact line where the returned snippet begins (the matched passage),
-    /// not just the section start — so `doc_path:match_line` jumps straight to it with no
-    /// second search. Falls back to `line_start` if the snippet can't be located (e.g. an
-    /// empty body). Always within `line_start..=line_end`.
+    /// D-10.16: the line where the returned `body` window BEGINS — the match sits within
+    /// the next few lines of it (the window is centered on the match, so this is the
+    /// window's first line, not the match's own line). Falls back to `line_start` if the
+    /// window can't be located (e.g. an empty body). Always within `line_start..=line_end`.
     pub match_line: i64,
     pub rank: Option<f64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CodeResult {
+    /// Absolute path of the repo this chunk lives in — the missing half of `path`.
+    ///
+    /// `path` is repo-RELATIVE (it joins to `commit_entries.files_changed`), which
+    /// makes an unscoped hit unopenable on a multi-repo index: `src/mcp/query.rs`
+    /// names a different file in every tree that has one, and the caller cannot
+    /// tell which was meant. `repo_path` + `path` is the openable location.
+    ///
+    /// `None` only for chunks indexed before this column existed and not yet
+    /// reindexed — read it as UNKNOWN, never as "no repo".
+    pub repo_path: Option<String>,
     /// Repo-relative path of the source file (joins to `commit_entries.files_changed`).
     pub path: String,
     pub line_start: i64,
     pub line_end: i64,
     /// Best-effort language tag from extension (NULL when unrecognized).
     pub language: Option<String>,
-    /// Chunk body, bounded to `SOURCE_BODY_CHAR_LIMIT` chars (and omitted once the
-    /// per-call total-body budget is spent). When bounded, `body_truncated` is true —
-    /// use `path` + `line_start`/`line_end` to read the full chunk.
+    /// A MATCH-centered window of the chunk (FTS5 `snippet`, ≤64 tokens), further
+    /// bounded to `SOURCE_BODY_CHAR_LIMIT` chars and omitted once the per-call
+    /// total-body budget is spent. NOT the whole 50-line chunk: any chunk longer than
+    /// the window comes back with `body_truncated: true` — use `repo_path` + `path` +
+    /// `line_start`/`line_end` to read it in full.
     pub body: String,
     /// First 200 chars of body, word-boundary truncated.
     pub body_excerpt: String,
     /// True when `body` was capped or omitted by the budget (full text lives at
     /// `path` lines `line_start`..=`line_end`).
     pub body_truncated: bool,
-    /// D-10.16: the exact line where the returned snippet begins (the matched code), not
-    /// just the chunk start — `path:match_line` jumps straight to it. Falls back to
-    /// `line_start` if the snippet can't be located. Always within `line_start..=line_end`.
+    /// D-10.16: the line where the returned `body` window BEGINS — the match sits within
+    /// the next few lines of it (the window is centered on the match, so this is the
+    /// window's first line, not the match's own line). Falls back to `line_start` if the
+    /// window can't be located. Always within `line_start..=line_end`.
     pub match_line: i64,
     /// Freshness of the returned location vs the live working tree, established at
     /// query time (DESIGN §9.4 explicit freshness signal): `"verified"` (file unchanged
@@ -192,14 +296,20 @@ pub struct CodeResult {
     /// chunk was re-anchored — the line numbers in THIS result are already corrected;
     /// `line_shift` carries the move), `"stale"` (file changed and the chunk could not
     /// be re-anchored — line numbers may be wrong), or `"file_missing"` (the indexed
-    /// file no longer exists at this path). The index heals on commit, so non-verified
-    /// statuses mark uncommitted working-tree drift.
+    /// file no longer exists at this path). "Since indexing" is the working tree as it
+    /// was when `nibdex index` / the on-commit reindex last ran — the extractor reads
+    /// the working tree, not HEAD — so `verified` means unchanged since then, not
+    /// "committed". The index re-reads on commit, so non-verified statuses usually
+    /// mark uncommitted drift made after that pass.
     pub location: String,
     /// `Some(n)` only when `location == "relocated"`: the chunk moved n lines
     /// (+down / −up) since indexing; the corrected range already includes it.
     pub line_shift: Option<i64>,
-    /// The PROVENANCE commit that last touched this chunk's file — the code↔commit
-    /// join (D1_SCOPE §1, §7). NULL when the commit isn't indexed (e.g. capped out).
+    /// The PROVENANCE commit that last touched this chunk's FILE at HEAD when it was
+    /// indexed — the code↔commit join (D1_SCOPE §1, §7). File-level last-touch, not
+    /// line-level blame; and because the chunk text is the working tree at index
+    /// time, uncommitted content in `body` is NOT in this commit. NULL when the
+    /// commit isn't indexed (e.g. capped out) or the repo has no commits.
     pub commit_sha: Option<String>,
     pub commit_summary: Option<String>,
     pub rank: Option<f64>,
@@ -219,7 +329,9 @@ pub struct CheckResult {
     /// Per-tool p50 latency (ms) over the last hour. Empty until tools are exercised.
     pub perf_p50_ms: BTreeMap<String, i64>,
     pub perf_p95_ms: BTreeMap<String, i64>,
-    /// Populated by Day 6 commit 4 file-watcher integration. Null in stdio mode (D-6.4.1).
+    /// Live file-watcher state, read from the `file_watcher_state` row a running
+    /// `serve`/`watch` daemon heartbeats into this db (60 s liveness gate). Null when
+    /// no daemon is live on this db — including plain stdio use with no daemon.
     pub file_watcher: Option<FileWatcherStats>,
     /// Latest duration_ms per `extract.*` op_name.
     pub extractors_last_run_ms: BTreeMap<String, i64>,
@@ -234,6 +346,72 @@ pub struct CheckResult {
     /// DROP-classified for `metrics-export` (§4.2): an interrogation/health
     /// surface, kept off the metrics payload.
     pub build: BuildInfo,
+    /// Corpora that are DELIBERATELY retired: still in the schema, possibly still
+    /// holding rows, but read by no query tool. Their counts — including their
+    /// orphan counts — are not index damage, and must not be read as a defect.
+    ///
+    /// `session_entries` is the standing case. Its rows come from a CLAUDE.md
+    /// format nothing writes any more; `find_session`/`recent_sessions` moved to
+    /// `session_edges`. On a real second corpus every surviving row was orphaned
+    /// while `session_edges` was healthy and serving — which is what settled the
+    /// fix-vs-supersede fork toward supersede. Reviving the parser would have
+    /// needed synthetic identity plus a schema migration to recover rows nothing
+    /// reads.
+    ///
+    /// Naming it here is the honest half: the number stays visible and true, and
+    /// stops being mistaken for a broken index. Additive-optional (absent when
+    /// nothing is retired), so no `CHECK_SCHEMA_VERSION` bump.
+    ///
+    /// ⚠️ `Option<Vec<_>>` + `Option::is_none`, NOT `Vec` + `Vec::is_empty`.
+    /// `schemars` derives `required` from the Rust type, not from serde's skip
+    /// attribute, so a bare `Vec` is advertised in the tool's `outputSchema` as
+    /// mandatory and then omitted whenever it is empty — which is the healthy
+    /// case. That makes every `check()` on a clean index fail schema validation
+    /// while a damaged one passes. `Option` is the only shape that makes the
+    /// advertised contract and the emitted JSON agree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_corpora: Option<Vec<RetiredCorpus>>,
+    /// THE DENOMINATOR. How much retrieval work happened in the sessions this
+    /// index has seen, and how much of it nibdex actually served.
+    ///
+    /// Every other instrument here — the JSONL sink, the cost ledger,
+    /// `cost_savings` below — fires only when a nibdex tool is CALLED, which
+    /// makes them survivorship-biased by construction. They report savings in
+    /// proportion to use and are structurally blind to non-use: a period in
+    /// which nibdex was never called records nothing, which reads as a quiet
+    /// stretch rather than as a total miss. `cost_savings` can only ever
+    /// deliver good news.
+    ///
+    /// This is the number that can say "you have a problem". Absent when no
+    /// session activity has been indexed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adoption: Option<Adoption>,
+}
+
+/// Retrieval share across the indexed sessions — counts only, never content.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Adoption {
+    /// Sessions with any retrieval activity at all.
+    pub sessions_seen: i64,
+    /// ...of which, sessions that called nibdex at least once.
+    pub sessions_using_nibdex: i64,
+    /// Retrieval calls that went elsewhere (built-in search tools, shell greps).
+    pub retrieval_elsewhere: i64,
+    /// Retrieval calls that went to nibdex.
+    pub nibdex_queries: i64,
+    /// nibdex's share of all retrieval, as a percentage. The headline.
+    pub nibdex_share_pct: f64,
+}
+
+/// One retired corpus, and why its non-zero counts are not a defect.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RetiredCorpus {
+    /// The table name, as it appears under `indexer` and `orphans`.
+    pub corpus: String,
+    /// Rows still present.
+    pub rows: i64,
+    /// What superseded it, so the reader knows where the live data went.
+    pub superseded_by: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -260,6 +438,10 @@ pub struct OrphanCounts {
     pub session_entries: i64,
     pub memory_entries: i64,
     pub design_doc_sections: i64,
+    /// Source chunks whose `documents` row names a file that no longer exists on
+    /// disk. `nibdex index` prunes files that left the git index, so a non-zero
+    /// count here means uncommitted deletions or a repo indexed then removed.
+    pub source_chunks: i64,
     pub indexed_repos: i64,
 }
 
@@ -277,8 +459,10 @@ pub struct FileWatcherStats {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RecentSessionsRequest {
-    /// Optional FTS5 MATCH expression narrowing the body text. Pass raw FTS5 syntax —
-    /// nibdex does not transform the query (D-6.1.4). Omit for plain recency ordering.
+    /// Optional FTS5 MATCH expression narrowing the rationale + path text. FTS5
+    /// syntax; tokens FTS5 would reject (`fan-out`, `v0.1.3`) are auto-quoted, and
+    /// nothing else is rewritten (no OR-broadening on the recency path). Omit for
+    /// plain recency ordering.
     #[serde(default)]
     pub filter: Option<String>,
 
@@ -340,6 +524,11 @@ pub struct FindDesignDocRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindCodeRequest {
     pub query: String,
+    /// Optional repo scope: a substring of the repo's absolute path (e.g. `"nibdex"`).
+    /// Matches the same repo string `recent_commits`/`find_commit` take, so one
+    /// value scopes code and commits alike. Absent = every indexed repo.
+    #[serde(default)]
+    pub repo: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
 }

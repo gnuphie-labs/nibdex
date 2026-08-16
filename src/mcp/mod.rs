@@ -42,7 +42,7 @@ pub(crate) use self::types::{CheckResult, IndexerCounts, OrphanCounts, Stages};
 // fully-populated `CheckResult` sample); scrub code reaches its fields through
 // `CheckResult.file_watcher` without naming the type.
 #[cfg(test)]
-pub(crate) use self::types::FileWatcherStats;
+pub(crate) use self::types::{Adoption, FileWatcherStats, RetiredCorpus};
 
 #[derive(Clone)]
 pub struct NibdexServer {

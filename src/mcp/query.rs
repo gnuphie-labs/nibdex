@@ -11,14 +11,14 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use super::format::{
-    SessionEdgeRow, build_commit_result, build_session_edge_result, finish_commit_envelope,
+    SessionEdgeRow, annotate_empty_result, build_commit_result, build_session_edge_result, finish_commit_envelope,
     finish_session_edge_envelope, summarize,
 };
 use super::fts5::{
     fts5_or_broadened, like_substring, match_count_with_or_fallback, sanitize_fts5_query,
 };
 use super::types::{
-    CodeResult, CommitResult, DEFAULT_DAYS, DEFAULT_LIMIT, DESIGN_DOC_BODY_CHAR_LIMIT,
+    CodeResult, CommitResult, Corpus, DEFAULT_DAYS, DEFAULT_LIMIT, DESIGN_DOC_BODY_CHAR_LIMIT,
     DESIGN_DOC_TOTAL_BODY_BUDGET, DesignDocResult, FindCodeRequest, FindCommitRequest,
     FindDesignDocRequest, FindMemoryRequest, FindSessionRequest, MAX_LIMIT, MemoryResult,
     RecentCommitsRequest, RecentSessionsRequest, SOURCE_BODY_CHAR_LIMIT, SOURCE_TOTAL_BODY_BUDGET,
@@ -99,8 +99,9 @@ async fn run_recent_sessions_without_filter(
         .into_iter()
         .map(|r| build_session_edge_result(r, None))
         .collect();
-    let envelope = finish_session_edge_envelope(results, total, "recent_sessions", false);
+    let mut envelope = finish_session_edge_envelope(results, total, "recent_sessions", false);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::SessionEdges).await;
     Ok(envelope)
 }
 
@@ -159,8 +160,9 @@ async fn run_recent_sessions_with_filter(
         .into_iter()
         .map(|r| build_session_edge_result(r, None))
         .collect();
-    let envelope = finish_session_edge_envelope(results, total, "recent_sessions", false);
+    let mut envelope = finish_session_edge_envelope(results, total, "recent_sessions", false);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::SessionEdges).await;
     Ok(envelope)
 }
 
@@ -231,8 +233,9 @@ pub async fn run_find_session(
             build_session_edge_result((sid, tool, fp, rp, gb, ea, rat, ch, cs), Some(rank))
         })
         .collect();
-    let envelope = finish_session_edge_envelope(results, total, "find_session", broadened);
+    let mut envelope = finish_session_edge_envelope(results, total, "find_session", broadened);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::SessionEdges).await;
     Ok(envelope)
 }
 
@@ -286,7 +289,7 @@ async fn run_recent_commits_without_filter(
     let t0 = Instant::now();
     let (total,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM commit_entries c \
-         WHERE c.authored_at >= ? AND (? IS NULL OR c.repo_path LIKE ?)",
+         WHERE c.authored_at >= ? AND (? IS NULL OR c.repo_path LIKE ? ESCAPE '\\')",
     )
     .bind(cutoff_unix)
     .bind(repo_like)
@@ -302,7 +305,7 @@ async fn run_recent_commits_without_filter(
                 r.is_shallow \
          FROM commit_entries c \
          LEFT JOIN indexed_repos r ON r.repo_path = c.repo_path \
-         WHERE c.authored_at >= ? AND (? IS NULL OR c.repo_path LIKE ?) \
+         WHERE c.authored_at >= ? AND (? IS NULL OR c.repo_path LIKE ? ESCAPE '\\') \
          ORDER BY c.authored_at DESC, c.commit_hash \
          LIMIT ?",
     )
@@ -319,8 +322,9 @@ async fn run_recent_commits_without_filter(
         .into_iter()
         .map(|r| build_commit_result(r, None))
         .collect();
-    let envelope = finish_commit_envelope(results, total, "recent_commits", false);
+    let mut envelope = finish_commit_envelope(results, total, "recent_commits", false);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::CommitEntries).await;
     Ok(envelope)
 }
 
@@ -355,7 +359,7 @@ async fn run_recent_commits_with_filter(
          JOIN commit_entries c ON c.id = s.rowid_ref AND s.source_table = 'commit_entries' \
          WHERE s.body MATCH ? \
            AND c.authored_at >= ? \
-           AND (? IS NULL OR c.repo_path LIKE ?)",
+           AND (? IS NULL OR c.repo_path LIKE ? ESCAPE '\\')",
     )
     .bind(&match_filter)
     .bind(cutoff_unix)
@@ -375,7 +379,7 @@ async fn run_recent_commits_with_filter(
          LEFT JOIN indexed_repos r ON r.repo_path = c.repo_path \
          WHERE s.body MATCH ? \
            AND c.authored_at >= ? \
-           AND (? IS NULL OR c.repo_path LIKE ?) \
+           AND (? IS NULL OR c.repo_path LIKE ? ESCAPE '\\') \
          ORDER BY c.authored_at DESC, rank ASC, c.commit_hash \
          LIMIT ?",
     )
@@ -395,8 +399,9 @@ async fn run_recent_commits_with_filter(
             build_commit_result((ch, rp, ph, ae, an, aa, ca, ms, mb, fc, sh), Some(rank))
         })
         .collect();
-    let envelope = finish_commit_envelope(results, total, "recent_commits", false);
+    let mut envelope = finish_commit_envelope(results, total, "recent_commits", false);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::CommitEntries).await;
     Ok(envelope)
 }
 
@@ -437,7 +442,7 @@ pub async fn run_find_commit(
              FROM search_index s \
              JOIN commit_entries c ON c.id = s.rowid_ref AND s.source_table = 'commit_entries' \
              WHERE s.body MATCH ? \
-               AND (? IS NULL OR c.repo_path LIKE ?)",
+               AND (? IS NULL OR c.repo_path LIKE ? ESCAPE '\\')",
         )
         .bind(q)
         .bind(repo_bind)
@@ -475,7 +480,7 @@ pub async fn run_find_commit(
          JOIN commit_entries c ON c.id = s.rowid_ref AND s.source_table = 'commit_entries' \
          LEFT JOIN indexed_repos r ON r.repo_path = c.repo_path \
          WHERE s.body MATCH ? \
-           AND (? IS NULL OR c.repo_path LIKE ?) \
+           AND (? IS NULL OR c.repo_path LIKE ? ESCAPE '\\') \
          ORDER BY rank ASC, c.authored_at DESC, c.commit_hash \
          LIMIT ?",
     )
@@ -494,8 +499,9 @@ pub async fn run_find_commit(
             build_commit_result((ch, rp, ph, ae, an, aa, ca, ms, mb, fc, sh), Some(rank))
         })
         .collect();
-    let envelope = finish_commit_envelope(results, total, "find_commit", broadened);
+    let mut envelope = finish_commit_envelope(results, total, "find_commit", broadened);
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::CommitEntries).await;
     Ok(envelope)
 }
 
@@ -554,15 +560,18 @@ pub async fn run_find_memory(
     // Memory bodies are returned untrimmed → the result body is the full read size.
     let returned_full_tokens =
         (results.iter().map(|r| r.body.chars().count()).sum::<usize>() / 4) as u64;
-    let envelope = ToolEnvelope {
+    let mut envelope = ToolEnvelope {
         results,
         total_matched: total,
         returned,
         tool: "find_memory".to_string(),
         query_broadened: broadened,
+        corpus_empty: None,
+        corpus_indexed_through: None,
         returned_full_tokens,
     };
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::MemoryEntries).await;
     Ok(envelope)
 }
 
@@ -668,15 +677,18 @@ pub async fn run_find_design_doc(
 
     let returned = results.len() as i64;
     let returned_full_tokens = (returned_full_chars / 4) as u64;
-    let envelope = ToolEnvelope {
+    let mut envelope = ToolEnvelope {
         results,
         total_matched: total,
         returned,
         tool: "find_design_doc".to_string(),
         query_broadened: broadened,
+        corpus_empty: None,
+        corpus_indexed_through: None,
         returned_full_tokens,
     };
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::DesignDocSections).await;
     Ok(envelope)
 }
 
@@ -697,16 +709,51 @@ pub async fn run_find_code(
     let sanitized = sanitize_fts5_query(query);
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-    const COUNT_SQL: &str = "SELECT COUNT(*) \
-         FROM search_index s \
-         JOIN source_chunks sc ON sc.id = s.rowid_ref AND s.source_table = 'source_chunks' \
-         WHERE s.body MATCH ?";
+    // Repo scope. `source_chunks.path` is repo-relative by design (it joins to
+    // `commit_entries.files_changed`), so on a multi-repo index an unscoped hit is
+    // not openable: `src/mcp/query.rs` names a different file in every tree that
+    // has one. Substring match on the stored repo root, escaped — same shape as
+    // `recent_commits`, so one repo string scopes code and commits alike.
+    let repo_like = req.repo.as_deref().map(like_substring);
+    let repo_bind = repo_like.as_deref();
+
+    // D-10.13 OR-fallback, inlined rather than via `match_count_with_or_fallback`
+    // because the COUNT carries the repo filter's extra binds — same reason as
+    // `recent_commits`. The filter lives INSIDE the counted set, so `total_matched`
+    // describes the scoped corpus rather than the whole index.
+    let count_code = |q: String| async move {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) \
+             FROM search_index s \
+             JOIN source_chunks sc ON sc.id = s.rowid_ref AND s.source_table = 'source_chunks' \
+             WHERE s.body MATCH ? \
+               AND (? IS NULL OR sc.repo_path LIKE ? ESCAPE '\\')",
+        )
+        .bind(q)
+        .bind(repo_bind)
+        .bind(repo_bind)
+        .fetch_one(pool)
+        .await?;
+        Ok::<i64, anyhow::Error>(n)
+    };
     let t0 = Instant::now();
-    let (match_query, total, broadened) =
-        match_count_with_or_fallback(pool, COUNT_SQL, query, &sanitized).await?;
+    let (match_query, total, broadened) = {
+        let total = count_code(sanitized.clone()).await?;
+        if total == 0 {
+            if let Some(b) = fts5_or_broadened(query, &sanitized) {
+                let bt = count_code(b.clone()).await?;
+                if bt > 0 { (b, bt, true) } else { (sanitized.clone(), total, false) }
+            } else {
+                (sanitized.clone(), total, false)
+            }
+        } else {
+            (sanitized, total, false)
+        }
+    };
     stages.fts5_query_ms = t0.elapsed().as_millis() as u64;
 
     type Row = (
+        Option<String>,
         String,
         i64,
         i64,
@@ -731,7 +778,7 @@ pub async fn run_find_code(
     // The `documents` join carries the absolute path + stored mtime/hash for the
     // query-time freshness gate (source_index::location_status).
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT path, line_start, line_end, language, snip, full_chars, rank, \
+        "SELECT repo_path, path, line_start, line_end, language, snip, full_chars, rank, \
                 commit_sha, commit_summary, \
                 CASE WHEN off > 0 \
                      THEN line_start + (length(substr(body, 1, off - 1)) \
@@ -739,7 +786,8 @@ pub async fn run_find_code(
                      ELSE line_start END AS match_line, \
                 doc_path, doc_mtime, doc_hash, body \
          FROM ( \
-             SELECT sc.path AS path, sc.line_start AS line_start, sc.line_end AS line_end, \
+             SELECT sc.repo_path AS repo_path, \
+                    sc.path AS path, sc.line_start AS line_start, sc.line_end AS line_end, \
                     sc.language AS language, sc.body AS body, \
                     snippet(search_index, 0, '', '', '…', 64) AS snip, \
                     length(sc.body) AS full_chars, \
@@ -752,11 +800,14 @@ pub async fn run_find_code(
              JOIN documents d ON d.id = sc.document_id \
              LEFT JOIN commit_entries ce ON ce.id = sc.last_commit_id \
              WHERE s.body MATCH ? \
+               AND (? IS NULL OR sc.repo_path LIKE ? ESCAPE '\\') \
              ORDER BY rank ASC, sc.path, sc.line_start \
              LIMIT ? \
          )",
     )
     .bind(&match_query)
+    .bind(repo_bind)
+    .bind(repo_bind)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -774,7 +825,7 @@ pub async fn run_find_code(
     let results: Vec<CodeResult> = rows
         .into_iter()
         .map(
-            |(path, line_start, line_end, language, snippet_body, full_chars, rank, commit_sha, commit_summary, match_line, doc_path, doc_mtime, doc_hash, full_body)| {
+            |(repo_path, path, line_start, line_end, language, snippet_body, full_chars, rank, commit_sha, commit_summary, match_line, doc_path, doc_mtime, doc_hash, full_body)| {
                 let full_len = full_chars.max(0) as usize;
                 returned_full_chars += full_len;
                 let body_out = if spent_chars >= SOURCE_TOTAL_BODY_BUDGET {
@@ -801,6 +852,7 @@ pub async fn run_find_code(
                     &stored,
                 );
                 CodeResult {
+                    repo_path,
                     path,
                     line_start: loc.line_start,
                     line_end: loc.line_end,
@@ -821,14 +873,17 @@ pub async fn run_find_code(
 
     let returned = results.len() as i64;
     let returned_full_tokens = (returned_full_chars / 4) as u64;
-    let envelope = ToolEnvelope {
+    let mut envelope = ToolEnvelope {
         results,
         total_matched: total,
         returned,
         tool: "find_code".to_string(),
         query_broadened: broadened,
+        corpus_empty: None,
+        corpus_indexed_through: None,
         returned_full_tokens,
     };
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
+    annotate_empty_result(&mut envelope, pool, Corpus::SourceChunks).await;
     Ok(envelope)
 }

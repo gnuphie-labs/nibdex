@@ -298,6 +298,7 @@ struct ExportOrphans {
     session_entries: String,
     memory_entries: String,
     design_doc_sections: String,
+    source_chunks: String,
     indexed_repos: String,
 }
 
@@ -518,6 +519,7 @@ fn scrub_snapshot(c: &CheckResult) -> (ExportSnapshot, usize) {
             session_entries: count_bucket(c.orphans.session_entries),
             memory_entries: count_bucket(c.orphans.memory_entries),
             design_doc_sections: count_bucket(c.orphans.design_doc_sections),
+            source_chunks: count_bucket(c.orphans.source_chunks),
             indexed_repos: count_bucket(c.orphans.indexed_repos),
         },
         shallow_repo_count: c.shallow_repos.len(),

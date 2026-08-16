@@ -7,8 +7,9 @@
 
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
+use sqlx::SqlitePool;
 
-use super::types::{CommitResult, SessionEdgeResult, ToolEnvelope};
+use super::types::{CommitResult, Corpus, SessionEdgeResult, ToolEnvelope};
 
 /// Row shape returned by `session_edges` queries (rank passed separately, as with
 /// the other builders): (session_id, tool, file_path, repo_path, git_branch,
@@ -74,6 +75,8 @@ pub(crate) fn finish_session_edge_envelope(
         returned,
         tool: tool.to_string(),
         query_broadened,
+        corpus_empty: None,
+        corpus_indexed_through: None,
         returned_full_tokens,
     }
 }
@@ -149,10 +152,49 @@ pub(crate) fn finish_commit_envelope(
         returned,
         tool: tool.to_string(),
         query_broadened,
+        corpus_empty: None,
+        corpus_indexed_through: None,
         returned_full_tokens,
     }
 }
 
+
+/// Diagnose a ZERO-RESULT response: did nothing match, or is there nothing to
+/// match? (`docs/IDEAS_SCRATCH.md` → "Absence is not a miss".)
+///
+/// An empty `results` array is ambiguous, and the ambiguity is not academic — it
+/// is exactly how nibdex spent a month being silently wrong about its own state.
+/// A caller that reads "no results" as "this workspace has no such thing" makes a
+/// decision on a fact nibdex never established. So on a zero-result response, and
+/// ONLY then, say which case it is.
+///
+/// Costs two cheap aggregates, and only when there was nothing to report anyway —
+/// a hit path never pays for it. Additive-optional in the envelope, so this is
+/// not a `schema_version` bump (DESIGN §5.5 / D-8.7).
+pub(crate) async fn annotate_empty_result<T>(
+    envelope: &mut ToolEnvelope<T>,
+    pool: &SqlitePool,
+    corpus: Corpus,
+) {
+    if envelope.total_matched != 0 {
+        return;
+    }
+    let (count_sql, newest_sql) = corpus.probe_sql();
+    // A probe that itself fails must not turn an honest empty result into an
+    // error — leave the fields absent and let the caller see what it saw before.
+    let Ok(count) = sqlx::query_scalar::<_, i64>(count_sql).fetch_one(pool).await else {
+        return;
+    };
+    envelope.corpus_empty = Some(count == 0);
+    if count > 0 {
+        envelope.corpus_indexed_through = sqlx::query_scalar::<_, Option<i64>>(newest_sql)
+            .fetch_one(pool)
+            .await
+            .ok()
+            .flatten()
+            .map(unix_to_iso);
+    }
+}
 
 pub(crate) fn unix_to_iso(unix: i64) -> String {
     Utc.timestamp_opt(unix, 0)

@@ -227,6 +227,7 @@ async fn dispatch_one(
     path: &Path,
     corpus: Corpus,
     sub: &Subscription,
+    max_commits_per_repo: usize,
 ) -> Result<bool> {
     if corpus == Corpus::Commits {
         if let Subscription::GitRefs(repo_path) = sub {
@@ -235,7 +236,7 @@ async fn dispatch_one(
             // a commit can change both file content at HEAD and the provenance
             // commit each chunk points at (D1a "re-index-on-commit via GitRefs",
             // D1_SCOPE §5; live working-tree freshness is deferred to D1b).
-            indexer::reindex_commits_for_repo(pool, repo_path).await?;
+            indexer::reindex_commits_for_repo(pool, repo_path, max_commits_per_repo).await?;
             indexer::reindex_source_for_repo(pool, repo_path).await?;
             return Ok(true);
         }
@@ -259,12 +260,37 @@ async fn dispatch_one(
     }
 }
 
+/// Runtime knobs the daemon threads into per-event reindexing so the watcher
+/// path honours the same flags as `nibdex index` (RC1 review: the on-commit
+/// reindex used the built-in 50,000 cap regardless of `--max-commits-per-repo`).
+#[derive(Debug, Clone, Copy)]
+pub struct WatcherConfig {
+    pub max_commits_per_repo: usize,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self { max_commits_per_repo: indexer::GitOptions::default().max_commits_per_repo }
+    }
+}
+
 /// Run the watcher until the receiver-side shutdown channel resolves.
-/// Returns to the caller after a 1s drain window (D-6.2.6).
+/// Returns to the caller after a 1s drain window (D-6.2.6). Default config.
+#[allow(dead_code)]
 pub async fn serve(
     pool: SqlitePool,
     subscriptions: Vec<Subscription>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    serve_with(pool, subscriptions, shutdown_rx, WatcherConfig::default()).await
+}
+
+/// `serve` with explicit runtime knobs.
+pub async fn serve_with(
+    pool: SqlitePool,
+    subscriptions: Vec<Subscription>,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    config: WatcherConfig,
 ) -> Result<()> {
     if subscriptions.is_empty() {
         anyhow::bail!("watcher requires at least one subscription");
@@ -278,7 +304,8 @@ pub async fn serve(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Vec<DebouncedEvent>>();
     let _debouncer = spawn_debouncer(&subscriptions, event_tx.clone())?;
 
-    let dispatch_handle = tokio::spawn(run_dispatch_loop(pool.clone(), subscriptions, event_rx));
+    let dispatch_handle =
+        tokio::spawn(run_dispatch_loop(pool.clone(), subscriptions, event_rx, config));
     let heartbeat_handle = tokio::spawn(run_heartbeat_loop(pool.clone()));
 
     // Block until shutdown signal lands. ShutdownChannel resolves on
@@ -298,6 +325,7 @@ async fn run_dispatch_loop(
     pool: SqlitePool,
     subs: Vec<Subscription>,
     mut rx: UnboundedReceiver<Vec<DebouncedEvent>>,
+    config: WatcherConfig,
 ) {
     while let Some(batch) = rx.recv().await {
         if batch.is_empty() {
@@ -307,7 +335,8 @@ async fn run_dispatch_loop(
         let batch_len = batch.len() as i64;
         for ev in &batch {
             if let Some((corpus, sub)) = classify(&ev.path, &subs)
-                && let Err(e) = dispatch_one(&pool, &ev.path, corpus, &sub).await
+                && let Err(e) =
+                    dispatch_one(&pool, &ev.path, corpus, &sub, config.max_commits_per_repo).await
             {
                 eprintln!("[nibdex watcher] dispatch error on {:?}: {e:?}", ev.path);
             }
@@ -608,7 +637,7 @@ mod tests {
 
         // Create path → reindex_memory_file → row appears.
         let (corpus, sub) = classify(&mem_file, &subs).unwrap();
-        let ok = dispatch_one(&pool, &mem_file, corpus, &sub).await.unwrap();
+        let ok = dispatch_one(&pool, &mem_file, corpus, &sub, WatcherConfig::default().max_commits_per_repo).await.unwrap();
         assert!(ok);
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_entries")
             .fetch_one(&pool)
@@ -618,7 +647,7 @@ mod tests {
 
         // Delete path → delete_document_by_path cascades.
         tokio::fs::remove_file(&mem_file).await.unwrap();
-        let ok = dispatch_one(&pool, &mem_file, corpus, &sub).await.unwrap();
+        let ok = dispatch_one(&pool, &mem_file, corpus, &sub, WatcherConfig::default().max_commits_per_repo).await.unwrap();
         assert!(ok, "delete path should report success on first match");
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory_entries")
             .fetch_one(&pool)
@@ -646,7 +675,7 @@ mod tests {
             .await
             .unwrap();
         let (corpus, sub) = classify(&path, &subs).unwrap();
-        dispatch_one(&pool, &path, corpus, &sub).await.unwrap();
+        dispatch_one(&pool, &path, corpus, &sub, WatcherConfig::default().max_commits_per_repo).await.unwrap();
         let first: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM design_doc_sections")
             .fetch_one(&pool)
             .await
@@ -655,7 +684,7 @@ mod tests {
 
         // Rewrite with a different heading shape; prior sections must be swept.
         tokio::fs::write(&path, "# Top\nbody only\n").await.unwrap();
-        dispatch_one(&pool, &path, corpus, &sub).await.unwrap();
+        dispatch_one(&pool, &path, corpus, &sub, WatcherConfig::default().max_commits_per_repo).await.unwrap();
         let second: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM design_doc_sections")
             .fetch_one(&pool)
             .await
@@ -681,7 +710,7 @@ mod tests {
         let body = "# x\n\n## Recent session history\n\n- **#1**: alpha bb8 fixture\n- **#2**: bravo bb8 fixture\n";
         tokio::fs::write(&claude, body).await.unwrap();
         let (corpus, sub) = classify(&claude, &subs).unwrap();
-        dispatch_one(&pool, &claude, corpus, &sub).await.unwrap();
+        dispatch_one(&pool, &claude, corpus, &sub, WatcherConfig::default().max_commits_per_repo).await.unwrap();
         let first: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_entries")
             .fetch_one(&pool)
             .await
@@ -691,7 +720,7 @@ mod tests {
         // Trim CLAUDE.md so #2 disappears → UPSERT-then-sweep should drop the orphan.
         let trimmed = "# x\n\n## Recent session history\n\n- **#1**: alpha bb8 fixture\n";
         tokio::fs::write(&claude, trimmed).await.unwrap();
-        dispatch_one(&pool, &claude, corpus, &sub).await.unwrap();
+        dispatch_one(&pool, &claude, corpus, &sub, WatcherConfig::default().max_commits_per_repo).await.unwrap();
         let second: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_entries")
             .fetch_one(&pool)
             .await
@@ -849,7 +878,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<Vec<DebouncedEvent>>();
         let _debouncer = spawn_debouncer(&subscriptions, event_tx.clone())?;
         let dispatch_handle =
-            tokio::spawn(run_dispatch_loop(pool.clone(), subscriptions, event_rx));
+            tokio::spawn(run_dispatch_loop(pool.clone(), subscriptions, event_rx, WatcherConfig::default()));
         let heartbeat_handle = tokio::spawn(run_heartbeat_loop(pool.clone()));
         ready.notify_one();
         let _ = (&mut shutdown_rx).await;
@@ -980,6 +1009,27 @@ mod tests {
         );
     }
 
+    /// The on-commit reindex honours the daemon's `--max-commits-per-repo`
+    /// (RC1 review, sev-2: it used the built-in 50,000 regardless). A repo with
+    /// three commits dispatched with a cap of 1 lands exactly one commit.
+    /// Mutation this catches: `reindex_commits_for_repo` ignoring its cap arg.
+    #[tokio::test]
+    async fn dispatch_one_honours_max_commits_per_repo() {
+        let (workspace, pool) = fresh_pool().await;
+        let repo_path = workspace.path().canonicalize().unwrap();
+        let repo = init_repo_with_initial_commit(&repo_path);
+        commit_file(&repo, "README", "v2\n", "second");
+        commit_file(&repo, "README", "v3\n", "third");
+        let sub = Subscription::GitRefs(repo_path.clone()).canonicalize().unwrap();
+        let head_path = repo_path.join(".git").join("HEAD");
+        dispatch_one(&pool, &head_path, Corpus::Commits, &sub, 1).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM commit_entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "cap of 1 must land exactly one commit");
+    }
+
     /// dispatch_one on a Commits event re-indexes commits for the repo, lands
     /// the cursor in `indexed_repos`, and re-running on the same HEAD is a no-op.
     #[tokio::test]
@@ -993,7 +1043,7 @@ mod tests {
         let head_path = repo_path.join(".git").join("HEAD");
 
         // First dispatch: 1 commit lands, cursor written.
-        let ok = dispatch_one(&pool, &head_path, Corpus::Commits, &sub)
+        let ok = dispatch_one(&pool, &head_path, Corpus::Commits, &sub, WatcherConfig::default().max_commits_per_repo)
             .await
             .unwrap();
         assert!(ok);
@@ -1013,7 +1063,7 @@ mod tests {
 
         // Add a second commit and re-dispatch: count must rise.
         commit_file(&repo, "README", "hello v2\n", "second commit");
-        dispatch_one(&pool, &head_path, Corpus::Commits, &sub)
+        dispatch_one(&pool, &head_path, Corpus::Commits, &sub, WatcherConfig::default().max_commits_per_repo)
             .await
             .unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM commit_entries")
@@ -1023,7 +1073,7 @@ mod tests {
         assert_eq!(count.0, 2);
 
         // Third dispatch with no new commits: idempotent (count unchanged).
-        dispatch_one(&pool, &head_path, Corpus::Commits, &sub)
+        dispatch_one(&pool, &head_path, Corpus::Commits, &sub, WatcherConfig::default().max_commits_per_repo)
             .await
             .unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM commit_entries")
@@ -1049,7 +1099,7 @@ mod tests {
         let head_path = repo_path.join(".git").join("HEAD");
 
         // First dispatch seeds commit_entries + indexed_repos cursor.
-        dispatch_one(&pool, &head_path, Corpus::Commits, &sub)
+        dispatch_one(&pool, &head_path, Corpus::Commits, &sub, WatcherConfig::default().max_commits_per_repo)
             .await
             .unwrap();
         let baseline: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM commit_entries")
@@ -1070,7 +1120,7 @@ mod tests {
             .unwrap();
 
         // Re-dispatch: must succeed, no duplicates, cursor recovers to real HEAD.
-        dispatch_one(&pool, &head_path, Corpus::Commits, &sub)
+        dispatch_one(&pool, &head_path, Corpus::Commits, &sub, WatcherConfig::default().max_commits_per_repo)
             .await
             .unwrap();
         let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM commit_entries")
@@ -1120,6 +1170,7 @@ mod tests {
             &repo_a.join(".git").join("HEAD"),
             Corpus::Commits,
             &sub_a,
+            WatcherConfig::default().max_commits_per_repo,
         )
         .await
         .unwrap();
@@ -1128,6 +1179,7 @@ mod tests {
             &repo_b.join(".git").join("HEAD"),
             Corpus::Commits,
             &_sub_b,
+            WatcherConfig::default().max_commits_per_repo,
         )
         .await
         .unwrap();
@@ -1155,6 +1207,7 @@ mod tests {
             &repo_a.join(".git").join("HEAD"),
             Corpus::Commits,
             &sub_a,
+            WatcherConfig::default().max_commits_per_repo,
         )
         .await
         .unwrap();
@@ -1182,6 +1235,7 @@ mod tests {
             &repo_b.join(".git").join("HEAD"),
             Corpus::Commits,
             &_sub_b,
+            WatcherConfig::default().max_commits_per_repo,
         )
         .await
         .unwrap();

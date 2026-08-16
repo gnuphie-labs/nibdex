@@ -4,7 +4,9 @@
 //!
 //! Indexes a repo's **git-tracked** files (auto-respects `.gitignore`, excludes
 //! `target/`, `node_modules/`, build junk) as the 5th corpus, in the proven
-//! `documents → child-table → search_index` mold:
+//! `documents → child-table → search_index` mold. The file CONTENT read is the
+//! WORKING TREE at index time (not the HEAD blob) — see LIMITATIONS "find_code
+//! indexes the working tree" — while provenance is last-touch at HEAD:
 //!   - one `documents` row per file (`kind='source'`),
 //!   - fixed line-window `source_chunks` rows (no overlap — D1_SCOPE §4.#3 MVP),
 //!   - one `search_index` FTS5 row per chunk (`source_table='source_chunks'`).
@@ -47,6 +49,12 @@ pub struct SourceIndexStats {
     pub skipped_binary: usize,
     pub skipped_large: usize,
     pub skipped_unreadable: usize,
+    /// Git-tracked symlinks whose target resolves OUTSIDE the repo root — read
+    /// through, they would index another tree's content under this repo's path
+    /// (and, in domain mode, another domain's content into this db — RC1 review
+    /// 1.2). In-repo symlinks are also skipped: their target is indexed at its
+    /// own path already.
+    pub skipped_symlink: usize,
     /// Files skipped because another corpus owns them (design docs, session
     /// CLAUDE.md) — the one-corpus-per-file guard (D1_SCOPE §10 path-collision).
     pub skipped_other_corpus: usize,
@@ -54,6 +62,12 @@ pub struct SourceIndexStats {
     /// their chunks + FTS rows were left untouched (the write-amp fix: a commit
     /// no longer rewrites the whole corpus, only the files it changed).
     pub files_unchanged: usize,
+    /// Files that were indexed by a prior pass but are no longer git-tracked
+    /// (deleted, renamed, or untracked since) — their document + chunks + FTS
+    /// rows were removed. Without this the corpus only ever grew, and a
+    /// deleted file kept answering `find_code` as `file_missing` forever while
+    /// `check()` reported it healthy (RC1 review 1.6).
+    pub files_pruned: usize,
     pub chunks: usize,
     /// Files whose provenance commit resolved to a `commit_entries.id`.
     pub provenance_hits: usize,
@@ -87,6 +101,12 @@ pub async fn index_source_repo(pool: &SqlitePool, repo: &Path) -> Result<SourceI
     };
     stats.files_tracked = files.len();
 
+    // Stamped on every chunk so a `find_code` hit says which tree it is in.
+    // Same derivation as `commit_entries.repo_path` (that extractor takes the
+    // `to_string_lossy` of this same `&Path`), so the two agree and a caller can
+    // filter code and commits by one repo string.
+    let repo_path_str = repo.to_string_lossy().into_owned();
+
     // commit_hash → commit_entries.id, so each file costs at most one lookup.
     let mut commit_id_cache: HashMap<String, Option<i64>> = HashMap::new();
 
@@ -104,6 +124,14 @@ pub async fn index_source_repo(pool: &SqlitePool, repo: &Path) -> Result<SourceI
             continue;
         }
         let abs = repo.join(rel);
+        // Git stores a symlink as a blob holding the link text; `fs::read` would
+        // follow it. Never read through a link: the content is either outside
+        // this repo (foreign — possibly another IP domain's) or already indexed
+        // at its real path.
+        if std::fs::symlink_metadata(&abs).is_ok_and(|m| m.file_type().is_symlink()) {
+            stats.skipped_symlink += 1;
+            continue;
+        }
         let bytes = match std::fs::read(&abs) {
             Ok(b) => b,
             Err(_) => {
@@ -198,9 +226,39 @@ pub async fn index_source_repo(pool: &SqlitePool, repo: &Path) -> Result<SourceI
         wipe_existing_chunks(&mut tx, document_id).await?;
 
         let n =
-            index_file_chunks(&mut tx, document_id, rel, language, text, last_commit_id).await?;
+            index_file_chunks(&mut tx, document_id, &repo_path_str, rel, language, text, last_commit_id)
+                .await?;
         stats.chunks += n;
         stats.files_indexed += 1;
+    }
+
+    // PRUNE: any `documents(kind='source')` row under this repo whose path is
+    // no longer in the git index has left the tree (deleted, renamed, or
+    // untracked). Drop its chunks + FTS rows + document so the corpus tracks
+    // the tree instead of accreting every path it ever saw. Only paths that
+    // are DIRECT children of this repo root are considered — a nested repo's
+    // files belong to its own pass. Working-tree-only deletions (file removed
+    // but still in the index) are NOT pruned here: they stay `file_missing`
+    // at query time and count under `check().orphans.source_chunks`.
+    let prefix = format!("{}/", repo_path_str.trim_end_matches('/'));
+    let stored_docs: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, path FROM documents WHERE kind = 'source' AND substr(path, 1, ?) = ?")
+            .bind(prefix.chars().count() as i64)
+            .bind(&prefix)
+            .fetch_all(&mut *tx)
+            .await?;
+    let tracked: std::collections::HashSet<String> =
+        files.iter().map(|rel| format!("{prefix}{rel}")).collect();
+    for (doc_id, path) in stored_docs {
+        if tracked.contains(&path) {
+            continue;
+        }
+        wipe_existing_chunks(&mut tx, doc_id).await?;
+        sqlx::query("DELETE FROM documents WHERE id = ?")
+            .bind(doc_id)
+            .execute(&mut *tx)
+            .await?;
+        stats.files_pruned += 1;
     }
 
     tx.commit().await?;
@@ -380,6 +438,7 @@ async fn wipe_existing_chunks(conn: &mut sqlx::SqliteConnection, document_id: i6
 async fn index_file_chunks(
     conn: &mut sqlx::SqliteConnection,
     document_id: i64,
+    repo_path: &str,
     rel: &str,
     language: Option<&str>,
     text: &str,
@@ -400,12 +459,14 @@ async fn index_file_chunks(
         let row: (i64,) = sqlx::query_as(
             r#"
             INSERT INTO source_chunks
-                (document_id, path, line_start, line_end, language, body, last_commit_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (document_id, repo_path, path, line_start, line_end, language, body,
+                 last_commit_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             "#,
         )
         .bind(document_id)
+        .bind(repo_path)
         .bind(rel)
         .bind(line_start)
         .bind(line_end)
@@ -688,6 +749,10 @@ fn is_distinctive(trimmed: &str) -> bool {
 /// proves the lexical code↔commit thread is worth it.
 #[derive(Debug)]
 pub struct CodeHit {
+    /// Absolute root of the repo this chunk lives in. `path` is repo-RELATIVE,
+    /// so this is the half that makes a hit openable — and on a multi-repo index
+    /// the only thing distinguishing one repo's `src/main.rs` from another's.
+    pub repo_path: Option<String>,
     pub path: String,
     pub line_start: i64,
     pub line_end: i64,
@@ -709,10 +774,30 @@ pub struct CodeHit {
 }
 
 pub async fn find_code(pool: &SqlitePool, query: &str, limit: i64) -> Result<Vec<CodeHit>> {
+    find_code_in_repo(pool, query, limit, None).await
+}
+
+/// `find_code`, optionally constrained to ONE repo.
+///
+/// The scope is applied in SQL, not to the returned rows, for the same reason the
+/// hook over-fetches: filtering after `LIMIT` means the globally top-ranked N may
+/// contain none of the caller's repo, so the narrower and more correct the scope,
+/// the likelier the answer is empty.
+///
+/// Exact equality on the stored root, never a substring. A substring test is what
+/// produced the defect this exists to fix — a search scoped to `src/` inside one
+/// repo was answered from another repo's `src/`, because every repo has one.
+pub async fn find_code_in_repo(
+    pool: &SqlitePool,
+    query: &str,
+    limit: i64,
+    repo: Option<&str>,
+) -> Result<Vec<CodeHit>> {
     // Mirror the proven find_* shape: `FROM search_index s ... bm25(search_index)
     // ... WHERE s.body MATCH ? ORDER BY rank`. LEFT JOIN so a chunk with no
     // resolved provenance still returns (commit fields NULL).
     type Row = (
+        Option<String>,
         String,
         i64,
         i64,
@@ -733,7 +818,7 @@ pub async fn find_code(pool: &SqlitePool, query: &str, limit: i64) -> Result<Vec
     // CLI excerpt; the MCP tool is the snippet-bounded one. Unifying the two is a
     // logged follow-up.)
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT path, line_start, line_end, \
+        "SELECT repo_path, path, line_start, line_end, \
                 CASE WHEN off > 0 \
                      THEN line_start + (length(substr(body, 1, off - 1)) \
                                         - length(replace(substr(body, 1, off - 1), char(10), ''))) \
@@ -741,7 +826,8 @@ pub async fn find_code(pool: &SqlitePool, query: &str, limit: i64) -> Result<Vec
                 language, rank, body, commit_sha, commit_summary, \
                 doc_path, doc_mtime, doc_hash \
          FROM ( \
-             SELECT sc.path AS path, sc.line_start AS line_start, sc.line_end AS line_end, \
+             SELECT sc.repo_path AS repo_path, \
+                    sc.path AS path, sc.line_start AS line_start, sc.line_end AS line_end, \
                     sc.language AS language, bm25(search_index) AS rank, sc.body AS body, \
                     ce.commit_hash AS commit_sha, ce.message_summary AS commit_summary, \
                     d.path AS doc_path, d.mtime AS doc_mtime, d.content_hash AS doc_hash, \
@@ -751,11 +837,14 @@ pub async fn find_code(pool: &SqlitePool, query: &str, limit: i64) -> Result<Vec
              JOIN documents d ON d.id = sc.document_id \
              LEFT JOIN commit_entries ce ON ce.id = sc.last_commit_id \
              WHERE s.body MATCH ? \
+               AND (? IS NULL OR sc.repo_path = ?) \
              ORDER BY rank ASC \
              LIMIT ? \
          )",
     )
     .bind(query)
+    .bind(repo)
+    .bind(repo)
     .bind(limit)
     .fetch_all(pool)
     .await?;
@@ -767,22 +856,23 @@ pub async fn find_code(pool: &SqlitePool, query: &str, limit: i64) -> Result<Vec
         .into_iter()
         .map(|r| {
             let stored = StoredChunk {
-                body: &r.6,
-                line_start: r.1,
-                line_end: r.2,
-                match_line: r.3,
+                body: &r.7,
+                line_start: r.2,
+                line_end: r.3,
+                match_line: r.4,
             };
-            let loc = resolve_location(&mut cache, &r.9, r.10, &r.11, &stored);
+            let loc = resolve_location(&mut cache, &r.10, r.11, &r.12, &stored);
             CodeHit {
-                path: r.0,
+                repo_path: r.0,
+                path: r.1,
                 line_start: loc.line_start,
                 line_end: loc.line_end,
                 match_line: loc.match_line,
-                language: r.4,
-                rank: r.5,
-                body: r.6,
-                commit_sha: r.7,
-                commit_summary: r.8,
+                language: r.5,
+                rank: r.6,
+                body: r.7,
+                commit_sha: r.8,
+                commit_summary: r.9,
                 location: loc.status,
                 line_shift: loc.line_shift,
             }
@@ -913,9 +1003,73 @@ mod tests {
         assert!(!is_owned_by_other_corpus("subdir/notes.md"));
     }
 
+    /// A repo-scoped search must not be answered from a different repo.
+    ///
+    /// The live failure this gates: `grep -rn AppState src/` inside one repo came
+    /// back with another project's `backend/src/handlers/`, because the hook
+    /// honours the caller's scope as a substring of a repo-RELATIVE path and every
+    /// repo has a `src/`. The answer arrived with provenance and an "index
+    /// current" stamp — well-formed, well-labelled, wrong codebase — and nothing
+    /// prompted the caller to doubt it, because they had not asked nibdex anything.
+    #[tokio::test]
+    async fn a_repo_scoped_search_never_answers_from_another_repo() {
+        let (_tmp, pool) = fresh_pool().await;
+        for (repo, rel, body) in [
+            ("/ws/alpha", "src/main.rs", "struct AppState { alpha_field: u8 }"),
+            ("/ws/beta", "src/main.rs", "struct AppState { beta_field: u8 }"),
+        ] {
+            let doc: (i64,) = sqlx::query_as(
+                "INSERT INTO documents (path, kind, content_hash, mtime, indexed_at) \
+                 VALUES (?, 'source', 'h', 0, 0) RETURNING id",
+            )
+            .bind(format!("{repo}/{rel}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let chunk: (i64,) = sqlx::query_as(
+                "INSERT INTO source_chunks \
+                   (document_id, repo_path, path, line_start, line_end, language, body) \
+                 VALUES (?, ?, ?, 1, 50, 'rust', ?) RETURNING id",
+            )
+            .bind(doc.0).bind(repo).bind(rel).bind(body)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO search_index (body, kind, rowid_ref, source_table) \
+                 VALUES (?, 'source', ?, 'source_chunks')",
+            )
+            .bind(body).bind(chunk.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Unscoped: both repos answer, and each hit says which one it is.
+        let all = find_code(&pool, "AppState", 10).await.unwrap();
+        assert_eq!(all.len(), 2, "both repos define AppState");
+        assert!(
+            all.iter().all(|h| h.repo_path.is_some()),
+            "every hit must carry the repo that makes it openable"
+        );
+
+        // Scoped: ONLY the named repo, even though the other has an identical
+        // relative path and an equally good rank.
+        let scoped = find_code_in_repo(&pool, "AppState", 10, Some("/ws/beta")).await.unwrap();
+        assert_eq!(scoped.len(), 1, "the other repo's identical path must not answer");
+        assert_eq!(scoped[0].repo_path.as_deref(), Some("/ws/beta"));
+        assert!(scoped[0].body.contains("beta_field"), "returned beta's code, not alpha's");
+
+        // An unknown repo yields nothing rather than falling back to everything —
+        // silence beats a confident answer from the wrong tree.
+        let none = find_code_in_repo(&pool, "AppState", 10, Some("/ws/nope")).await.unwrap();
+        assert!(none.is_empty(), "an unmatched scope must not degrade to unscoped");
+    }
+
     #[test]
     fn grep_line_is_quickfix_shaped() {
         let hit = CodeHit {
+            repo_path: Some("/ws/proj".into()),
             path: "src/rescore.rs".into(),
             line_start: 42,
             line_end: 50,
@@ -939,6 +1093,7 @@ mod tests {
     #[test]
     fn grep_line_flags_non_verified_locations() {
         let mut hit = CodeHit {
+            repo_path: Some("/ws/proj".into()),
             path: "src/a.rs".into(),
             line_start: 1,
             line_end: 50,
@@ -1097,6 +1252,62 @@ mod tests {
         assert_eq!(relocate_chunk(CHUNK, 40, "fn tiny() {}"), None);
     }
 
+    // -- RC1 review 1.10: the relocator's guards, each with a mutation it catches --
+
+    #[test]
+    fn relocate_below_quorum_is_stale_not_a_guess() {
+        // CHUNK has 4 distinctive lines; the live file keeps only ONE of them
+        // (1/4 < 50%) at a new offset. Stage 1 cannot match; stage 2 must refuse
+        // the single vote. Mutation caught: dropping the `n * 2 < len` quorum
+        // check → Some(1).
+        let file = "// x\n// y\n    let author = oldest_code();\n// z";
+        assert_eq!(relocate_chunk(CHUNK, 2, file), None);
+    }
+
+    #[test]
+    fn relocate_short_lines_do_not_vote() {
+        // Every line is < 8 chars, so none is distinctive; a torn copy of the
+        // chunk (one line changed, so stage 1 fails) shifted by 2 must NOT be
+        // relocated by three short-line votes. Mutation caught: `is_distinctive`
+        // threshold 8 → 1 gives 3/4 votes for shift 2 → Some(2).
+        let chunk = "a = 1;\nb = 2;\nc = 3;\nd = 4;";
+        let file = "// p\n// q\na = 1;\nb = 2;\nX\nd = 4;";
+        assert_eq!(relocate_chunk(chunk, 1, file), None);
+        assert!(!is_distinctive("a = 1;"));
+        assert!(is_distinctive("let x = 1;"));
+        assert!(!is_distinctive("--------"), "punctuation-only never votes");
+    }
+
+    #[test]
+    fn freshness_gate_clamps_relocated_range_to_the_live_file() {
+        // The stored range (1..=6) is longer than the live file allows after a
+        // +2 shift: a 6-line file cannot host lines 3..=8. `line_end` clamps to
+        // the file length and `match_line` stays inside the range. Mutation
+        // caught: removing the `.min(file_lines)` clamp → line_end 8.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.rs");
+        let stored_body = "fn alpha_one() {}\nfn beta_two() {}\nfn gamma_three() {}";
+        let live = format!("{}{}\n// tail", "// filler\n".repeat(2), stored_body);
+        std::fs::write(&path, &live).unwrap(); // 6 lines: 2 filler + 3 chunk + tail
+        let real_mtime = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let abs = path.to_string_lossy().into_owned();
+        let mut cache = FreshnessCache::new();
+        let stored = StoredChunk { body: stored_body, line_start: 1, line_end: 6, match_line: 6 };
+        let loc = resolve_location(&mut cache, &abs, real_mtime - 100, "0ddhash", &stored);
+        assert_eq!(loc.status, LocationStatus::Relocated);
+        assert_eq!(loc.line_shift, Some(2));
+        assert_eq!(loc.line_start, 3);
+        assert_eq!(loc.line_end, 6, "clamped to the 6-line file, not 8");
+        assert!(loc.match_line >= loc.line_start && loc.match_line <= loc.line_end);
+        assert_eq!(loc.match_line, 6);
+    }
+
     // -- the write-amp fix: content-hash skip + provenance-only refresh -------------
 
     async fn fresh_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -1156,6 +1367,42 @@ mod tests {
             .fetch_all(pool)
             .await
             .unwrap()
+    }
+
+    /// The extractor must actually STAMP the repo on every chunk it writes.
+    ///
+    /// The query-layer repo-scope tests seed `source_chunks` directly, so all of
+    /// them would still pass if this bound NULL — the write path needs its own
+    /// gate or the scope silently degrades to "matches nothing" on a real index.
+    /// Also pins the value to the same string the commits extractor stores, since
+    /// one `repo` argument is documented to scope code and commits alike.
+    #[tokio::test]
+    async fn every_indexed_chunk_is_stamped_with_its_repo() {
+        let (_tmp, pool) = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        commit_file(&repo, "a.rs", "fn alpha_entry() {\n    alpha_body();\n}\n", "add a");
+
+        let stats = index_source_repo(&pool, dir.path()).await.unwrap();
+        assert!(stats.chunks > 0, "the fixture must actually produce chunks");
+
+        let unstamped: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM source_chunks WHERE repo_path IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unstamped, 0, "every chunk written by the extractor carries its repo");
+
+        let stored: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT repo_path FROM source_chunks")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            vec![dir.path().to_string_lossy().into_owned()],
+            "the stamp must equal the repo root the commits extractor also stores"
+        );
     }
 
     /// The headline write-amp behavior: a reindex over an UNCHANGED corpus rewrites
@@ -1218,6 +1465,64 @@ mod tests {
         assert!(a_body.contains("alpha_v2"));
     }
 
+    /// A file that leaves the git index (deleted + committed) leaves the corpus
+    /// on the next pass: its document, chunks, and FTS rows are removed and the
+    /// pass reports it as pruned. Before this the corpus only grew, so a deleted
+    /// file kept answering `find_code` (as `file_missing`) forever while
+    /// `check()` reported it healthy (RC1 review 1.6). Mutation this catches:
+    /// removing the prune loop leaves 2 documents / 2 FTS rows and `pruned == 0`.
+    #[tokio::test]
+    async fn reindex_prunes_files_no_longer_tracked() {
+        let (_tmp, pool) = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        commit_file(&repo, "keep.rs", "fn keep_entry() {\n    keep_body();\n}\n", "add keep");
+        commit_file(&repo, "gone.rs", "fn gone_entry() {\n    gone_body();\n}\n", "add gone");
+        index_source_repo(&pool, dir.path()).await.unwrap();
+        let docs_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM documents WHERE kind = 'source'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(docs_before, 2);
+
+        // Delete gone.rs from the tree AND the git index, then commit.
+        std::fs::remove_file(dir.path().join("gone.rs")).unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.remove_path(Path::new("gone.rs")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let sig = repo.signature().unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "rm gone", &tree, &[&head]).unwrap();
+        }
+        let stats = index_source_repo(&pool, dir.path()).await.unwrap();
+        assert_eq!(stats.files_pruned, 1, "gone.rs must be reported as pruned");
+
+        let docs_after: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM documents WHERE kind = 'source' ORDER BY path")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(docs_after.len(), 1);
+        assert!(docs_after[0].ends_with("keep.rs"), "only keep.rs survives: {docs_after:?}");
+        let gone_chunks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM source_chunks WHERE path = 'gone.rs'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(gone_chunks, 0, "chunks of the pruned file are gone");
+        let fts_hits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM search_index WHERE source_table = 'source_chunks' AND body MATCH 'gone_body'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fts_hits, 0, "FTS rows of the pruned file are gone");
+    }
+
     /// Binary and non-UTF-8 files are skipped, not lossily indexed: a NUL-bearing
     /// blob (the classic sniff) AND a NUL-free but invalid-UTF-8 file (the gap the
     /// null-byte check alone misses) both count as `skipped_binary`; only the real
@@ -1264,7 +1569,7 @@ mod tests {
         let original = "fn gamma_entry() {\n    gamma_body();\n}\n";
         commit_file(&repo, "g.rs", original, "add g");
         // Commits corpus first (the watcher's order) so provenance resolves.
-        crate::indexer::reindex_commits_for_repo(&pool, dir.path()).await.unwrap();
+        crate::indexer::reindex_commits_for_repo(&pool, dir.path(), 50_000).await.unwrap();
         index_source_repo(&pool, dir.path()).await.unwrap();
         let (ids_before, prov_before): (Vec<i64>, Option<i64>) = (
             chunk_ids(&pool).await,
@@ -1278,7 +1583,7 @@ mod tests {
         // Change then REVERT to byte-identical content — two new commits.
         commit_file(&repo, "g.rs", "fn gamma_entry() {\n    gamma_v2();\n}\n", "change g");
         commit_file(&repo, "g.rs", original, "revert g");
-        crate::indexer::reindex_commits_for_repo(&pool, dir.path()).await.unwrap();
+        crate::indexer::reindex_commits_for_repo(&pool, dir.path(), 50_000).await.unwrap();
         let stats = index_source_repo(&pool, dir.path()).await.unwrap();
 
         assert_eq!(stats.files_unchanged, 1, "hash matches the stored state");

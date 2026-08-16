@@ -2,6 +2,8 @@
 
 # SQLite (FTS5 index + WAL/SHM sidecars)
 *.db
+*.db.bak*
+*.bak-*
 *.db-journal
 *.db-wal
 *.db-shm

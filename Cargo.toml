@@ -1,9 +1,13 @@
 [package]
 name = "nibdex"
-version = "0.2.0-rc.0"
+version = "0.2.0-rc.2"
 edition = "2024"
 description = "nibdex — derived MCP index over a workspace's source code, git commits, design docs, memory, and AI session history"
 license = "MIT"
+# The PUBLIC home — what crates.io renders and what README/GOVERNANCE point at.
+# Development happens on the private remote github.com/gnuphie/nibdex; releases
+# are a fresh tree from HEAD pushed to gnuphie-labs (see dogfood/release-gate.sh),
+# so this line must name the public repo in the tree that ships.
 repository = "https://github.com/gnuphie-labs/nibdex"
 readme = "README.md"
 keywords = ["mcp", "search", "index", "fts5", "local-first"]
@@ -24,6 +28,12 @@ exclude = [
     "docs/D1_SCOPE.md",
     "docs/GEAR2_DESIGN.md",
     "docs/GEAR2_HANDOFF.md",
+    "docs/LABEL_DEPTH_DESIGN.md",
+    "docs/OFFLOAD_IDEAS_2026-08-13.md",
+    "docs/ADOPTION.md",
+    "docs/TOOL_SURFACE_DESIGN.md",
+    "docs/RC1_REVIEW_TRIAGE.md",
+    "docs/reviews/",
     "dogfood/",
     "baselines/",
 ]
@@ -44,6 +54,11 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "io-std", "signal"] }
 tokio-util = "0.7"
 toml = "0.8"
+# Comment/format-preserving TOML writer. `.nibdex-domains.toml` is the IP-domain
+# security boundary and carries user comments; a round-trip that silently
+# reformats or drops them is unacceptable for a file people must be able to
+# audit by eye. Already in the tree transitively via `toml`.
+toml_edit = "0.22"
 walkdir = "2"
 
 # Per-target dependency linkage — keeps the macOS build byte-for-byte unchanged

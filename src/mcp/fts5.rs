@@ -113,3 +113,37 @@ pub(crate) async fn match_count_with_or_fallback(
     }
     Ok((sanitized.to_string(), total, false))
 }
+
+/// Turn a raw database error into something the caller can act on.
+///
+/// An FTS5 parse failure is the one error an ordinary caller triggers by
+/// accident. `find_code("parse_config(")` is a natural thing to ask, and `(` is
+/// FTS5 grouping syntax, so SQLite rejects the whole query. What came back was
+/// `error returned from database: (code: 1) fts5: syntax error near ""` — which
+/// names no offending character, suggests no repair, and leaks the storage
+/// engine besides. A model that hits that once has no reason to try the tool
+/// again, which makes this an adoption defect as much as a contract one.
+///
+/// Erroring is the RIGHT behaviour here — the ordering is actionable error >
+/// silent adjustment > empty result, and quietly re-sanitizing until the query
+/// parses would answer a different question than the one asked, unmarked. What
+/// was missing is the actionable half, so this supplies it and drops the raw
+/// sqlx text. Non-FTS5 errors pass through untouched: this must not swallow a
+/// genuine "index is broken" into a syntax lecture.
+pub(crate) fn explain_query_error(msg: &str) -> String {
+    let lower = msg.to_ascii_lowercase();
+    let is_query_syntax = lower.contains("fts5: syntax error")
+        || lower.contains("fts5: phrase")
+        || lower.contains("unterminated string")
+        || lower.contains("no such column"); // an unquoted `foo:` parses as a column filter
+    if !is_query_syntax {
+        return msg.to_string();
+    }
+    "the query is not valid FTS5 MATCH syntax. nibdex takes FTS5 expressions, not \
+     natural language, and ( ) \" * ^ : are operators there — so a bare code \
+     fragment like parse_config( is read as syntax rather than as text. To search \
+     for it literally, wrap it in double quotes: \"parse_config(\". An unbalanced \
+     double quote fails the same way. This is a malformed query, NOT an empty or \
+     broken index."
+        .to_string()
+}

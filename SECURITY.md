@@ -66,10 +66,30 @@ These are documented design decisions (see
 | Asset | Where it lives | Exposure nibdex adds |
 |---|---|---|
 | The FTS5 index (`nibdex.db`) | Local disk, user-controlled dir | None beyond the source files it mirrors |
-| AI session-history edges (`session_edges`, opt-in `index-sessions`) | Drawn from `~/.claude/projects/<slug>`, **outside** the workspace tree | When populated, mirrors your own assistant-conversation rationale + touched file paths into the index; scoped to the workspace slug you pass |
+| AI session-history edges (`session_edges`, built by `nibdex index`) | Drawn from `~/.claude/projects/`, **outside** the workspace tree | Mirrors your own assistant-conversation rationale + touched file paths into the index. Scope is derived, not opt-in — see the note below |
 | Metrics ledger / JSONL sink | Local disk, opt-in, `off` by default | None (local file; disable with `--metrics-sink off`) |
 | MCP query surface | Loopback socket or stdio pipe | Loopback-only; no remote reachability |
 | `metrics-export` payload | A file you generate and choose to hand over | The only deliberate egress — scrubbed, see below |
+| `nibdex hook` firing log (`~/.nibdex/hook-log.jsonl`) | Your home directory, **outside** the workspace; written only if you wire the optional `PreToolUse` hook | One JSON line per search the hook served or missed: timestamp, outcome, the **search term** the caller typed, hit count, and the db path. No file contents, no result bodies, no command text. Delete the file or set `NIBDEX_HOOK_OFF=1` to stop it |
+
+> **Changed in 0.2.0-rc.1 — session indexing is no longer a separate opt-in step.**
+> `nibdex index` previously left `session_edges` empty unless you also ran
+> `index-sessions`, which meant a documented quickstart produced an empty
+> `find_session`. It now builds that corpus in the same pass, so **a plain
+> `nibdex index` reads your Claude Code transcripts**. Be aware of that if you
+> were relying on the old default to keep conversation rationale out of the
+> index.
+>
+> What it reads is **derived from `--workspace`, not from a flag**, and both
+> ends are scoped: an edit is indexed only if the session was working inside
+> the workspace *and* the file it touched is inside the workspace or in the
+> built-in neutral set (this workspace's own Claude directory and scratchpad).
+> So another workspace's sessions are not swept in, and neither are the writes
+> an in-workspace session makes into someone else's tree. Path matching is
+> component-wise, so a sibling directory sharing a name prefix is not admitted.
+>
+> Both drop counts are reported in the `nibdex index` summary. If you want the
+> corpus left alone entirely, point `--projects-dir` at an empty directory.
 
 ### Separating IP domains (multiple clients or employers on one machine)
 
@@ -102,9 +122,8 @@ Then build one **separate database per domain** with `--domain`, and query each
 through its own stdio MCP server pointed at that database:
 
 ```
-nibdex index          --domain client-a --workspace ~/ws --db ~/client-a.db
-nibdex index-sessions --domain client-a --workspace ~/ws --all-slugs --db ~/client-a.db
-nibdex mcp            --db ~/client-a.db     # this domain's query server (read-only)
+nibdex index --domain client-a --workspace ~/ws --db ~/client-a.db   # incl. sessions
+nibdex mcp   --db ~/client-a.db     # this domain's query server (never re-indexes)
 ```
 
 > **Domain databases are index-only — do not point the file-watching daemon
@@ -113,23 +132,59 @@ nibdex mcp            --db ~/client-a.db     # this domain's query server (read-
 > discovers into whatever database it holds, which would write *another* domain's
 > commits and source back into this one and break the guarantee below. In domain
 > mode a database is a point-in-time snapshot — refresh it by re-running
-> `nibdex index --domain client-a …` (and `index-sessions`). A domain-aware daemon
+> `nibdex index --domain client-a …`, which covers that domain's sessions too. A domain-aware daemon
 > is planned; until then, keep domain databases on the manual-reindex path and
-> query them with a per-database `nibdex mcp` (which only reads).
+> query them with a per-database `nibdex mcp` (which never re-indexes; it does write per-call latency rows to `op_measurements` in that db, and refuses to start if the db file does not exist).
 
 `--domain client-a` writes **only** that domain's labeled subdirs into `client-a.db`
 — across source, commits, design sections, **and** session edits. The guarantee,
 which is **mechanical and needle-testable** (it is enforced by an invariant test
 that fails the build on any cross-domain byte):
 
+**Two deliberate exceptions to "labeled subdirs only" — one a silent coverage gap
+with a documented remedy, one an explicit opt-in. Both are worth understanding before
+you rely on the boundary:**
+
+1. **Workspace-root files reach no domain.** They belong to no labeled subdir, so no
+   domain indexes them — silently. Put cross-cutting docs in a subdir that is both
+   labeled and its own git repo (see
+   [IP_DOMAINS.md](docs/IP_DOMAINS.md#two-things-that-need-a-convention)). This is a
+   coverage gap, not a leak.
+2. **The memory corpus is skipped unless claimed.** A domain may claim the workspace's
+   memory directory with a `[memory]` table. **This is the one place the boundary
+   rests on your assertion rather than on a check** — nibdex can verify a subdir label
+   against the filesystem, but it cannot verify what a memory note is about. The
+   directory is per-workspace, so a single-domain workspace's memory holds only that
+   domain's *files*; it may still contain *sentences* naming another domain (measured
+   on the author's own machine: 8 of 25 files, inside this project's own notes). If
+   one workspace holds several domains, they share a memory directory and the claim
+   would be untrue — leave it unclaimed.
+
+**The ratchet's neutral set — a location rule, not a content check.** A session is
+tainted by touching another domain's tree, but *not* by touching paths that belong to
+no domain at all: files directly in the workspace root, **this workspace's own**
+`~/.claude` slug directory, and its own temp scratch. Deliberately NOT `~/.claude`
+wholesale (it holds other workspaces' transcripts) and NOT temp dirs wholesale (a
+client checkout in `/tmp` is normal) — an adversarial review removed both. What
+remains is still judged by *place*, not by content: nibdex cannot verify that a
+root-level tracker or scratch file is free of another client's material, so a
+cross-client note left at the workspace root will not withhold. Move such notes per
+the convention. An **unlabeled subdirectory still
+taints** — that is the shape an unlabeled client tree takes. The narrowing is measured,
+not assumed: the previous rule withheld 89.5% of reasoning on a single-domain machine
+with a 100% false-alarm rate (partly definitional — the box had no second domain),
+while a companion replay of the same machine's work-workspace transcripts showed 90.8%
+of taints genuine. One developer's machine, n=344 edges — design motivation, not a
+safety claim.
+
 - A domain's database never contains **files, commits, design sections, or session
-  edits from another domain's tree**, and never contains **rationale prose from a
-  session that also touched another domain's tree**. When a single Claude session
-  edits across domains — or merely *reads/greps* another domain's file — that
-  session's rationale is withheld (replaced by a constant marker, never indexed)
-  from the first cross point onward, so the reasoning text can't launder foreign
-  content across. A foreign checkout's working-directory path and branch name are
-  dropped from the row.
+  edits from another domain's tree**. When a single Claude session edits across
+  domains — or merely *reads/greps* another domain's file inside the workspace —
+  that session's rationale is withheld (replaced by a constant marker, never
+  indexed) **from the first cross point to the end of the transcript**, so a session
+  that has crossed cannot go on laundering foreign content. A foreign checkout's
+  working-directory path and branch name are dropped from the row. On the limits of
+  that withholding, see the forward-only note below.
 
 What this **cannot** claim:
 
@@ -143,6 +198,20 @@ What this **cannot** claim:
   nothing, so it is admitted. Closing this would require judging what a sentence is
   "about," which is unreliable and — worse — unauditable, so nibdex draws the line
   at what it can prove.
+- That a **whole session** is scrubbed once it crosses. The ratchet is
+  **forward-only**. Rationale attached to edits made *before* the session's first
+  cross point is retained verbatim, and assistant prose routinely looks ahead
+  ("next I'll wire this into the acme flow") — so a forward reference written
+  before the crossing can reach this domain's database, even though the session
+  went on to touch another domain. The ratchet stops a crossed session from
+  *continuing* to launder; it does not retract what it already stored. Two
+  sessions with identical content but a different edit *order* therefore withhold
+  differently. Whole-session retraction was weighed and not taken: one stray read
+  late in a long session would erase hours of legitimate rationale, and this
+  project has already measured what an over-broad withholding predicate costs —
+  89.5% of rationales withheld on a single-domain box, essentially all false
+  positives — so widening the ratchet is not a free correction. Treat a session
+  you know crossed domains as one whose *early* rationale may name the other side.
 - A **complete** guard against every foreign-content vector. The taint set that
   drives the withholding is built from **path-bearing tool inputs** —
   `Edit`/`Write`/`Read`/`Grep`/`Glob`/`NotebookEdit` file targets. Vectors that
@@ -157,16 +226,22 @@ The mitigation for that residual is the same discipline nibdex is built around:
 classify work by which context is active and don't cross-pollinate one domain's
 detail into another domain's session. For strict contractual isolation, option 1
 (separate workspaces) or separate user accounts/machines remain the stronger
-boundary. Session indexing also **requires** an explicit `--slug` or `--all-slugs`,
-so it never silently pulls another workspace's transcripts into the wrong database.
+boundary. Session scope is **derived from `--workspace`** rather than requested by a
+flag (see the 0.2.0-rc.1 note above): an edit is indexed only when the session was
+working inside the workspace *and* wrote inside it or into the built-in neutral set.
+`index-sessions` still takes an explicit scope — `--workspace-scoped`, `--slug=<s>`,
+or `--all-slugs` — and `--all-slugs` is the one that ignores workspace bounds
+entirely, so on a machine holding more than one domain, prefer the other two.
 
-**Coverage note — a domain database indexes less.** It is built from that domain's
-labeled subdirs only, so two things are absent *by design*: the **memory corpus**
-(`find_memory` returns nothing — memory is workspace-global and isn't attributed to a
-domain), and **workspace-root files** that belong to no subdir (a root-level README or
-tracker is attributed to no domain, so it is indexed into none). Neither is a leak;
-both are fail-narrow omissions worth knowing when a domain db's `find_memory` or a
-root-doc lookup comes back empty.
+**Coverage note — a domain database indexes less, unless you act.** It is built from
+that domain's labeled subdirs, so two things are absent until you do something about
+them: the **memory corpus** (absent unless a domain claims it via `[memory]` — see the
+exceptions above; `find_memory` returns nothing until then), and **workspace-root
+files** that belong to no subdir (absent unless you move them into a labeled subdir
+that is also its own repo — the convention in
+[IP_DOMAINS.md](docs/IP_DOMAINS.md#two-things-that-need-a-convention)). Neither is a
+leak; both are fail-narrow omissions, and both are silent — worth knowing when a
+domain db's `find_memory` or a root-doc lookup comes back empty.
 
 **Operational note — domain databases are born in domain mode.** A per-domain
 database must be created by a `--domain` run from the start; do not convert an

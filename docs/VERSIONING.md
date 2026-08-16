@@ -42,6 +42,16 @@ Two things define `0.2.x`, and both illustrate why `0.x` reserves the right to c
 - **The transcript-based session index.** `find_session` and `recent_sessions` now return per-edit records recovered from Claude Code transcripts — the file, the rationale, and the capturing commit — replacing the empty CLAUDE.md-format corpus. This **changes their return shape** from `0.1.x` (no `session_number`/`todos_mentioned`/`decisions_made`; a flat per-edit record instead). Exactly the kind of contract change the policy above reserves for a minor bump.
 - **The IP-domain partition** — a cross-cutting isolation capability ([`IP_DOMAINS.md`](IP_DOMAINS.md)) that spans every corpus, orthogonal to the D-lane roadmap. It is the visible headline of this line.
 
+`0.2.0-rc.1` adds to that line without changing the tool contract: session
+indexing folds into `nibdex index`, and `corpus_empty` /
+`corpus_indexed_through` / `retired_corpora` are additive-optional fields that
+serialize only when they have something to say. Under the patch rule above that
+is a within-`0.2.0` change, not a new minor — the release candidate is still
+settling, so it stays an `-rc`. It does change one **default**: a plain
+`nibdex index` now reads your Claude Code transcripts. That is behavior, not
+contract, but it is called out in [`CHANGELOG.md`](../CHANGELOG.md) and
+[`SECURITY.md`](../SECURITY.md) rather than left to be discovered.
+
 ## Why this posture
 
 Experienced developers don't trust `1.0` / `2.0` versions on visibly-immature projects. SemVer's stability commitment at `1.0` is *binding*: every change after that must either preserve the public contract or carry a major bump. Under-promising and over-delivering is cheaper than the reverse.

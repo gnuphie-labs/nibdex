@@ -30,6 +30,35 @@ pub enum FindCodeFormat {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Answer a shell search from the index, as a Claude Code `PreToolUse` hook.
+    ///
+    /// Reads the hook event on stdin and, when the command is a search, prints
+    /// JSON attaching nibdex's answer as `additionalContext`. The search still
+    /// runs — this AUGMENTS it rather than replacing it, so the live result
+    /// stays authoritative for uncommitted work.
+    ///
+    /// Exists because nibdex's MCP tools are deferred by the host: reaching one
+    /// costs an extra call that `grep` never pays. `Bash` is resident, so
+    /// riding it delivers the index's answer at `grep`'s price.
+    ///
+    /// Fails open: any error, missing index, or unservable query prints nothing
+    /// and the tool proceeds untouched. `NIBDEX_HOOK_OFF=1` disables it.
+    ///
+    /// Wire it up in `<workspace>/.claude/settings.json`:
+    ///
+    ///   {"hooks": {"PreToolUse": [{"matcher": "Bash|Grep",
+    ///     "hooks": [{"type": "command",
+    ///                "command": "nibdex hook 2>/dev/null || true"}]}]}}
+    ///
+    /// ⚠️ Wire it with the `2>/dev/null || true` suffix, not bare. This command
+    /// fails open, but only once it is REACHED: an older binary without this
+    /// subcommand makes clap exit non-zero first, and a non-zero PreToolUse hook
+    /// BLOCKS the tool. Observed for real — a stale binary on another machine
+    /// blocked every Bash call in the session. The suffix guarantees exit 0 for
+    /// a missing binary, a missing subcommand, or any crash, while still passing
+    /// valid JSON through on stdout.
+    Hook,
+
     /// Run a full scan over the workspace and populate the documents table.
     Index {
         /// Workspace root. Defaults to the current directory.
@@ -39,6 +68,16 @@ pub enum Command {
         /// Override the auto-detected Claude memory directory.
         #[arg(long)]
         memory_dir: Option<PathBuf>,
+
+        /// Override the auto-detected Claude transcript root (`~/.claude/projects`).
+        ///
+        /// An edit joins the `find_session` corpus only when BOTH ends are in
+        /// scope: the session was working inside `--workspace`, and the file it
+        /// touched is inside `--workspace` too (or is this workspace's own Claude
+        /// directory or scratchpad). Everything else is skipped and counted.
+        /// Point this at an empty directory to index no sessions at all.
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
 
         /// SQLite database path.
         #[arg(long, default_value = "nibdex.db")]
@@ -160,34 +199,56 @@ pub enum Command {
     /// the `session_edges` map — one row per `Edit`/`Write` tool-call (the change)
     /// plus the nearest preceding assistant text (the rationale), branch/cwd/time-
     /// anchored and best-effort bound to the commit that captured it. Scope is
-    /// REQUIRED (`--slug` or `--all-slugs`) so a run never silently ingests another
-    /// workspace's transcripts. With `--domain`, only that domain's labeled subdirs'
-    /// edits are written (per-domain session isolation). Run `nibdex index` first on
-    /// the same `--db` so the session→commit binding resolves.
+    /// REQUIRED (`--workspace-scoped`, `--slug`, or `--all-slugs`) so a run never
+    /// silently ingests another workspace's transcripts. With `--domain`, only that
+    /// domain's labeled subdirs' edits are written (per-domain session isolation).
+    ///
+    /// `nibdex index` already indexes sessions `--workspace-scoped`; reach for this
+    /// command to re-scope a pass, or to refresh sessions without a full re-index.
     IndexSessions {
         /// Transcript root. Defaults to `~/.claude/projects`.
         #[arg(long)]
         projects_dir: Option<PathBuf>,
 
         /// Restrict to one workspace slug dir (e.g. `-Users-you-workspace`).
-        /// Pass this OR `--all-slugs` — scope is REQUIRED so a run never
-        /// silently ingests transcripts from another workspace / IP domain.
-        #[arg(long)]
+        /// Pass this, `--workspace-scoped`, or `--all-slugs` — scope is REQUIRED
+        /// so a run never silently ingests transcripts from another workspace /
+        /// IP domain.
+        ///
+        /// Every real slug begins with `-`, so both `--slug=<s>` and
+        /// `--slug <s>` are accepted here (hyphen-leading values are not parsed
+        /// as flags).
+        #[arg(long, allow_hyphen_values = true)]
         slug: Option<String>,
 
-        /// Scan every slug under `projects_dir` (machine-global). Explicit
-        /// opt-in; mutually exclusive with `--slug`.
+        /// Scan every slug, keeping only the edits that belong to `--workspace` at
+        /// BOTH ends: the session was working inside it, and the file it touched
+        /// is inside it (or is this workspace's own Claude directory or
+        /// scratchpad). Both drop counts are reported.
+        ///
+        /// This is what `nibdex index` does, and it is the right default: a
+        /// workspace's sessions are spread across one slug per directory Claude
+        /// was launched from, so no single `--slug` covers it.
+        #[arg(long, default_value_t = false)]
+        workspace_scoped: bool,
+
+        /// Scan every slug under `projects_dir` (machine-global), with NO
+        /// workspace filtering. Explicit opt-in; on a shared box this crosses
+        /// into other workspaces — prefer `--workspace-scoped`.
         #[arg(long, default_value_t = false)]
         all_slugs: bool,
 
-        /// Rebuild from scratch (wipe existing `session_edges` first). Default is
+        /// Re-derive the edges of every session this pass admits (drop that session's
+        /// prior rows, then re-insert from its transcripts). Sessions outside the
+        /// scope — other slugs, other domains, transcripts that have since rotated
+        /// away — are left untouched; this is not a table wipe. Default is
         /// an additive merge that never drops previously-indexed edges.
         #[arg(long, default_value_t = false)]
         rebuild: bool,
 
-        /// Workspace root — where `.nibdex-domains.toml` lives, used to resolve
-        /// which subdir each edit belongs to when `--domain` is set. Defaults to
-        /// the current directory. Ignored in unpartitioned mode.
+        /// Workspace root. Bounds `--workspace-scoped`, and (when `--domain` is
+        /// set) is where `.nibdex-domains.toml` lives. Defaults to the current
+        /// directory.
         #[arg(long)]
         workspace: Option<PathBuf>,
 
@@ -314,6 +375,11 @@ pub enum Command {
         /// (turn ON for a workspace-container layout — see `serve --include-nested-repos`).
         #[arg(long, default_value_t = false)]
         include_nested_repos: bool,
+
+        /// Cap per repo for the on-commit reindex — same knob as `index
+        /// --max-commits-per-repo` (DESIGN §9.12).
+        #[arg(long, default_value_t = 50_000)]
+        max_commits_per_repo: usize,
     },
 
     /// Run the HTTP MCP daemon (D-6.4.2-4) + file-watcher in one process.
@@ -362,6 +428,11 @@ pub enum Command {
         /// nested projects are skipped and the daemon indexes only the container.
         #[arg(long, default_value_t = false)]
         include_nested_repos: bool,
+
+        /// Cap per repo for the on-commit reindex — same knob as `index
+        /// --max-commits-per-repo` (DESIGN §9.12).
+        #[arg(long, default_value_t = 50_000)]
+        max_commits_per_repo: usize,
     },
 
     /// Emit an MCP-client config snippet tailored to this install. Pipe to
@@ -394,12 +465,104 @@ pub enum Command {
         name: String,
     },
 
+    /// Report what a domain's index actually covers, and config that cannot
+    /// work as written.
+    ///
+    /// The IP-domain partition fails quietly: content that reaches no domain
+    /// produces no error, it is simply absent. This surfaces those gaps —
+    /// labeled directories that are not git repositories (and so are invisible
+    /// to design-doc discovery), subdirectories in no domain, workspace-root
+    /// files, and content under your own labels that never made it in.
+    ///
+    /// It reports; it never infers which domain anything belongs to. It also
+    /// cannot tell you whether text in the database DISCUSSES another domain —
+    /// that residual is semantic (see SECURITY.md). Exits non-zero on ERROR
+    /// findings only.
+    Audit {
+        /// Workspace root — where `.nibdex-domains.toml` lives.
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+
+        /// The IP domain to audit — a key in `.nibdex-domains.toml`.
+        #[arg(long)]
+        domain: String,
+
+        /// The domain's database.
+        #[arg(long, default_value = "nibdex.db")]
+        db: PathBuf,
+
+        /// Skip the coverage check (which needs an indexed db) and report only
+        /// config problems. Useful BEFORE a first index.
+        #[arg(long)]
+        config_only: bool,
+
+        /// Emit findings as JSON instead of a report — for scripts, setup
+        /// automation, and CI config checks. Includes an `unassigned` list of
+        /// the subdirectories a caller would feed to `nibdex label`.
+        #[arg(long)]
+        json: bool,
+
+        /// After reporting, walk each subdirectory that is in no domain and ask
+        /// which domain owns it (or record it as deliberately unassigned).
+        /// Shows the exact config change and asks before writing anything.
+        /// Needs a terminal; edits are additive and never remove a label.
+        #[arg(long, conflicts_with_all = ["json", "stage_undecided"])]
+        triage: bool,
+
+        /// Write the subdirectories that are in no domain into `[unassigned]
+        /// undecided` in `.nibdex-domains.toml`, each with the observed evidence
+        /// as a comment — then decide by editing that file, moving entries into
+        /// a domain's list or into `acknowledged`.
+        ///
+        /// The config file is the only place the decision is auditable, so it is
+        /// also where the decision is made: no second format, no prompts, no
+        /// import step. Never writes a suggested domain. Edits are additive,
+        /// comments are preserved, and the audit reports whatever is still in
+        /// `undecided` until you move it out.
+        #[arg(long, conflicts_with_all = ["json", "triage"])]
+        stage_undecided: bool,
+    },
+
+    /// Assign a subdirectory to IP domain(s), or record it as deliberately
+    /// unassigned — the non-interactive counterpart to `audit --triage`.
+    ///
+    /// Takes a domain; never derives one. Edits are additive (this can add a
+    /// label, never remove or reorder one), comments and formatting in
+    /// `.nibdex-domains.toml` are preserved, and the result is re-validated
+    /// before the command returns. Re-index the affected domains afterwards —
+    /// this changes labels, not indexes.
+    Label {
+        /// The top-level subdirectory to assign, relative to the workspace root.
+        subdir: String,
+
+        /// Domain to label it for. Repeat to share across several domains.
+        #[arg(long, conflicts_with = "acknowledge")]
+        domain: Vec<String>,
+
+        /// Record it as reviewed and deliberately in no domain. Grants nothing:
+        /// it stays unindexed and still taints sessions that touch it.
+        #[arg(long, conflicts_with = "domain")]
+        acknowledge: bool,
+
+        /// Workspace root — where `.nibdex-domains.toml` lives.
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+
+        /// Print the change that would be made and exit without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Derive an IP-safe, scrubbed metrics payload from the JSONL stream + a
-    /// recomputed `check()` snapshot (`docs/METRICS_EXPORT_SPEC.md`). Writes a
-    /// candidate file for you to INSPECT and then hand over yourself — nibdex
-    /// never transmits it (zero network egress). Default-deny allowlist: only
-    /// contract-classified fields appear; raw queries, paths, and error
-    /// messages are dropped or transformed.
+    /// recomputed `check()` snapshot. Writes a candidate file for you to
+    /// INSPECT and then hand over yourself — nibdex never transmits it (zero
+    /// network egress). Default-deny allowlist: only contract-classified
+    /// fields appear; raw queries, paths, and error messages are dropped or
+    /// transformed.
+    ///
+    /// This is the ONLY command that produces a file intended to leave the
+    /// machine, so it is deliberately explicit: you run it, you read the
+    /// output, you decide whether to share it.
     MetricsExport {
         /// Path to the metrics JSONL stream (the `jsonl:<path>` sink target).
         #[arg(long, default_value = "./metrics.jsonl")]

@@ -38,15 +38,36 @@ struct HeadingMatch<'a> {
 }
 
 /// Extract all heading-delimited sections from a markdown document. Returns
-/// sections in document order. If the document has no headings, returns empty.
+/// sections in document order.
+///
+/// Text BEFORE the first heading (a README's badges + summary paragraph, a
+/// front-matter block, a note file that never uses `#`) is emitted as a leading
+/// section with an EMPTY `heading_path` and `line_start = 1`, and a document
+/// with no headings at all becomes one such section. Before this, that text was
+/// in no corpus: `find_design_doc` answered "no match" for a term sitting in
+/// the first paragraph of a README (RC1 review, sev-2). Whitespace-only
+/// preambles are not emitted.
 pub fn extract_sections(content: &str) -> Vec<DocSection> {
     let lines: Vec<&str> = content.lines().collect();
     let headings = find_headings(&lines);
+
+    let mut sections = Vec::with_capacity(headings.len() + 1);
+    let preamble_end = headings.first().map(|h| h.line_no - 1).unwrap_or(lines.len());
+    if preamble_end > 0 {
+        let body = lines[..preamble_end].join("\n");
+        if !body.trim().is_empty() {
+            sections.push(DocSection {
+                heading_path: String::new(),
+                line_start: 1,
+                line_end: preamble_end,
+                body,
+            });
+        }
+    }
     if headings.is_empty() {
-        return Vec::new();
+        return sections;
     }
 
-    let mut sections = Vec::with_capacity(headings.len());
     let mut stack: Vec<&str> = Vec::new();
 
     for (idx, h) in headings.iter().enumerate() {
@@ -181,6 +202,33 @@ mod tests {
         assert!(sections[0].body.contains("Body line B"));
     }
 
+    /// Preamble text and headingless files land in the corpus as a section with an
+    /// empty heading path (RC1 review, sev-2). Mutation this catches: dropping the
+    /// preamble branch → 1 section for the first doc, 0 for the second.
+    #[test]
+    fn preamble_and_headingless_docs_are_indexed() {
+        let content = "Badges and a summary mentioning walrus.\n\n# Top\n\nBody\n";
+        let sections = extract_sections(content);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading_path, "");
+        assert_eq!(sections[0].line_start, 1);
+        assert_eq!(sections[0].line_end, 2);
+        assert!(sections[0].body.contains("walrus"));
+        assert!(!sections[0].body.contains("# Top"), "preamble stops before the heading");
+        assert_eq!(sections[1].heading_path, "Top");
+        assert_eq!(sections[1].line_start, 3);
+
+        let headingless = extract_sections("just notes\nabout an albatross\n");
+        assert_eq!(headingless.len(), 1);
+        assert_eq!(headingless[0].heading_path, "");
+        assert_eq!((headingless[0].line_start, headingless[0].line_end), (1, 2));
+        assert!(headingless[0].body.contains("albatross"));
+
+        assert!(extract_sections("\n\n# Top\nx\n")[0].heading_path == "Top",
+            "whitespace-only preamble is not emitted");
+        assert!(extract_sections("").is_empty());
+    }
+
     #[test]
     fn nested_headings_build_path() {
         let content = "\
@@ -231,9 +279,12 @@ sub content
     }
 
     #[test]
-    fn no_headings_returns_empty() {
+    fn no_headings_yields_one_unnamed_section() {
         let content = "just\nsome\nlines\n";
-        assert!(extract_sections(content).is_empty());
+        let sections = extract_sections(content);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].heading_path, "");
+        assert_eq!(sections[0].body, "just\nsome\nlines");
     }
 
     #[test]
@@ -291,8 +342,10 @@ done
         // `#` with nothing after is not a markdown heading.
         let content = "#\n# Real\ncontent\n";
         let sections = extract_sections(content);
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].heading_path, "Real");
+        // The bare `#` line is preamble text (unnamed section), then `Real`.
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading_path, "");
+        assert_eq!(sections[1].heading_path, "Real");
     }
 
     #[test]
@@ -300,7 +353,9 @@ done
         // ATX headings are 1-6; seven hashes is not a heading.
         let content = "####### too deep\n# Real\ncontent\n";
         let sections = extract_sections(content);
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].heading_path, "Real");
+        // The seven-hash line is preamble text (unnamed section), then `Real`.
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].heading_path, "");
+        assert_eq!(sections[1].heading_path, "Real");
     }
 }

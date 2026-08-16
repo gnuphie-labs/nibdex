@@ -19,7 +19,7 @@ use crate::watcher;
 use super::format::percentile;
 use super::types::{
     CHECK_SCHEMA_VERSION, CheckResult, FileWatcherStats, IndexerCounts, OrphanCounts,
-    PERF_WINDOW_SECS, Stages,
+    Adoption, PERF_WINDOW_SECS, RetiredCorpus, Stages,
 };
 
 pub async fn run_check(
@@ -45,6 +45,9 @@ pub async fn run_check(
         None => None,
     };
 
+    let retired_corpora = retired_corpora(&indexer);
+    let adoption = compute_adoption(pool).await?;
+
     let result = CheckResult {
         schema_version: CHECK_SCHEMA_VERSION,
         daemon_uptime_s: uptime_s,
@@ -57,9 +60,64 @@ pub async fn run_check(
         extractors_last_run_ms,
         cost_savings,
         build: crate::build_info::build_info(),
+        retired_corpora,
+        adoption,
     };
     stages.shape_response_ms = t.elapsed().as_millis() as u64;
     Ok(result)
+}
+
+/// Name the corpora whose counts are deliberately dead, so a reader does not
+/// take them for damage.
+///
+/// Only reported when rows actually survive — a workspace that never had a
+/// CLAUDE.md-format session log gets a clean `check()` with no archaeology in it.
+fn retired_corpora(indexer: &IndexerCounts) -> Option<Vec<RetiredCorpus>> {
+    let mut out = Vec::new();
+    if indexer.session_entries > 0 {
+        out.push(RetiredCorpus {
+            corpus: "session_entries".to_string(),
+            rows: indexer.session_entries,
+            superseded_by: "session_edges".to_string(),
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The denominator (see [`Adoption`]). `None` when no session activity has been
+/// indexed, so a workspace that has never run the session pass gets a clean
+/// `check()` rather than a misleading 0%.
+async fn compute_adoption(pool: &SqlitePool) -> Result<Option<Adoption>> {
+    let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT COUNT(*), \
+                COALESCE(SUM(nibdex_calls > 0), 0), \
+                COALESCE(SUM(retrieval_calls), 0), \
+                COALESCE(SUM(nibdex_calls), 0) \
+         FROM session_activity",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some((sessions_seen, sessions_using_nibdex, retrieval_elsewhere, nibdex_queries)) = row
+    else {
+        return Ok(None);
+    };
+    if sessions_seen == 0 {
+        return Ok(None);
+    }
+    let total = retrieval_elsewhere + nibdex_queries;
+    Ok(Some(Adoption {
+        sessions_seen,
+        sessions_using_nibdex,
+        retrieval_elsewhere,
+        nibdex_queries,
+        // Rounded to one decimal so a tiny share reads as a tiny share rather
+        // than disappearing into 0.
+        nibdex_share_pct: if total == 0 {
+            0.0
+        } else {
+            (nibdex_queries as f64 * 1000.0 / total as f64).round() / 10.0
+        },
+    }))
 }
 
 async fn read_file_watcher_stats(pool: &SqlitePool) -> Result<Option<FileWatcherStats>> {
@@ -144,6 +202,8 @@ async fn compute_orphans(pool: &SqlitePool) -> Result<OrphanCounts> {
             OrphanChild::DesignSection,
         )
         .await?,
+        source_chunks: compute_orphans_by_missing_doc(pool, "source", OrphanChild::SourceChunk)
+            .await?,
         indexed_repos: compute_repo_orphans(pool).await?,
     })
 }
@@ -194,6 +254,7 @@ async fn compute_session_orphans(pool: &SqlitePool) -> Result<i64> {
 enum OrphanChild {
     Memory,
     DesignSection,
+    SourceChunk,
 }
 
 async fn compute_orphans_by_missing_doc(
@@ -219,6 +280,7 @@ async fn compute_orphans_by_missing_doc(
     let table = match child {
         OrphanChild::Memory => "memory_entries",
         OrphanChild::DesignSection => "design_doc_sections",
+        OrphanChild::SourceChunk => "source_chunks",
     };
     let sql = format!("SELECT COUNT(*) FROM {table} WHERE document_id IN (");
     let mut qb: QueryBuilder<'_, sqlx::Sqlite> = QueryBuilder::new(sql);

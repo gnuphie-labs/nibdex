@@ -15,6 +15,7 @@ use crate::extractor::memory;
 use crate::extractor::session_history;
 use crate::hash::sha256_file;
 use crate::metrics::Op;
+use crate::session_index;
 
 #[derive(Debug, Default)]
 pub struct ScanStats {
@@ -35,11 +36,36 @@ pub struct ScanStats {
     pub source_chunks: u32,
     /// D1a: source files skipped because another corpus owns them (design/session).
     pub source_skipped_other_corpus: u32,
+    /// D1a: previously-indexed source files no longer git-tracked, removed this pass.
+    pub source_files_pruned: u32,
+    /// Transcript write-edges indexed (the `find_session` corpus).
+    pub session_edges: u32,
+    /// Transcripts read while gathering those edges, across every slug.
+    pub session_transcripts: u32,
+    /// Edges dropped because their session was working outside this workspace.
+    pub session_edges_dropped_foreign_workspace: u32,
+    /// Edges dropped because an in-workspace session wrote outside the workspace
+    /// (and outside the domain-neutral set).
+    pub session_edges_dropped_foreign_target: u32,
+    /// Transcripts skipped because they could not be read at all.
+    pub session_transcripts_unreadable: u32,
+    /// Edits skipped because their transcript line had no parseable timestamp.
+    pub session_edges_skipped_no_timestamp: u32,
+    /// Already-indexed edges that acquired their capturing commit on this pass.
+    pub session_edges_late_bound: u32,
+    /// Edges already present and skipped by the additive merge. Reported so a
+    /// re-index's `session_edges: 0` reads as "nothing NEW" rather than "nothing
+    /// there" — the same ambiguity `corpus_empty` removes on the query side.
+    pub session_edges_already_indexed: u32,
+    /// Why the session pass failed, when it did. The other five corpora are
+    /// unaffected — this is reported, not propagated.
+    pub session_index_error: Option<String>,
     pub extract_session_history_ms: u128,
     pub extract_memory_ms: u128,
     pub extract_design_docs_ms: u128,
     pub extract_commits_ms: u128,
     pub extract_source_ms: u128,
+    pub extract_session_edges_ms: u128,
     pub elapsed_ms: u128,
 }
 
@@ -98,7 +124,15 @@ pub fn discover_project_anchors(workspace: &Path, git_opts: GitOptions) -> Vec<P
 ///
 /// Convention: collapse `/`, `_`, and `.` in the absolute workspace path to `-`.
 /// E.g. `/Users/foo/projects` → `~/.claude/projects/-Users-foo-projects/memory/`.
-pub fn default_memory_dir(workspace: &Path) -> Option<PathBuf> {
+/// `~/.claude/projects/<encoded-workspace-path>` — Claude Code's per-workspace
+/// ("slug") directory: this workspace's transcripts AND its `memory/`. Claude
+/// Code owns the layout; the encoding mirrors its Unix scheme.
+///
+/// The SLUG dir, not `~/.claude` as a whole, is the workspace-segregated unit —
+/// `~/.claude` also holds OTHER workspaces' slugs, a flat cross-workspace
+/// `history.jsonl`, and an unpartitioned `file-history/`. Anything reasoning
+/// about "this workspace's Claude state" must anchor here.
+pub fn claude_slug_dir(workspace: &Path) -> Option<PathBuf> {
     // Home dir: `$HOME` on Unix, `%USERPROFILE%` on Windows.
     // NOTE (Windows port): the `/ _ .` → `-` encoding below was derived from
     // Claude Code's Unix project-dir scheme; Windows canonical paths add a
@@ -112,12 +146,12 @@ pub fn default_memory_dir(workspace: &Path) -> Option<PathBuf> {
         .chars()
         .map(|c| if matches!(c, '/' | '_' | '.') { '-' } else { c })
         .collect();
-    Some(
-        PathBuf::from(home)
-            .join(".claude/projects")
-            .join(encoded)
-            .join("memory"),
-    )
+    Some(PathBuf::from(home).join(".claude/projects").join(encoded))
+}
+
+/// `<claude_slug_dir>/memory` — the memory dir for this workspace.
+pub fn default_memory_dir(workspace: &Path) -> Option<PathBuf> {
+    Some(claude_slug_dir(workspace)?.join("memory"))
 }
 
 /// Which subset of the workspace an index pass writes: a single IP domain
@@ -137,12 +171,18 @@ impl DomainScope<'_> {
         let path = canon.as_deref().unwrap_or(path);
         self.config.includes(self.domain, workspace, path)
     }
+
+    /// Does this domain claim the workspace's memory dir (`[memory]`)?
+    fn claims_memory(&self) -> bool {
+        self.config.claims_memory(self.domain)
+    }
 }
 
 pub async fn full_scan(
     pool: &SqlitePool,
     workspace: &Path,
     memory_dir: Option<&Path>,
+    projects_dir: Option<&Path>,
     git_opts: GitOptions,
     domain: Option<&str>,
 ) -> Result<ScanStats> {
@@ -193,7 +233,9 @@ pub async fn full_scan(
     // 1. session_history — one `$ANCHOR/CLAUDE.md` per project anchor.
     for anchor in &anchors {
         let claude_md = anchor.join("CLAUDE.md");
-        if claude_md.exists() {
+        // `exists()` follows symlinks; a CLAUDE.md linked from another tree is
+        // that tree's content (RC1 review 1.2 — see `stays_within`).
+        if claude_md.exists() && stays_within(anchor, &claude_md) {
             let document_id = upsert_document(pool, &claude_md, "session_history").await?;
             stats.session_history += 1;
             let session_entries =
@@ -208,9 +250,15 @@ pub async fn full_scan(
     let memory = memory_dir
         .map(Path::to_path_buf)
         .or_else(|| default_memory_dir(&workspace));
-    // Memory is workspace-global (one dir, not per-subdir) → not domain-
-    // attributable; skip it in domain mode (Gear 2 decides its routing).
-    if scope.is_none()
+    // Memory is workspace-global (one dir, not per-subdir), so it is not
+    // filesystem-attributable the way a subdir is — and Claude Code owns its
+    // path, so it cannot be relocated into a labeled subdir the way workspace-
+    // root docs can (tracker 2026-07-18). In domain mode it is therefore skipped
+    // UNLESS the domain explicitly claims it via the `[memory]` table, which is
+    // an unverifiable user assertion (see `DomainConfig::claims_memory`).
+    // Fail-narrow: no claim → skipped, byte-for-byte the prior behavior.
+    let memory_claimed = scope.is_none_or(|s| s.claims_memory());
+    if memory_claimed
         && let Some(mem) = memory.as_ref()
         && mem.exists()
     {
@@ -249,6 +297,8 @@ pub async fn full_scan(
     // 4) must exist for provenance to resolve, and design/session docs (steps 1, 3)
     // must be indexed first so the one-corpus-per-file skip leaves their files to
     // them (source_index::is_owned_by_other_corpus). One repo at a time.
+    let source_op = Op::start("extract.source");
+    let mut source_bytes_hint: i64 = 0;
     for repo in git_commits::discover_repos(&workspace, git_opts.max_depth, git_opts.nested_mode) {
         if !keeps(&repo) {
             continue;
@@ -257,7 +307,101 @@ pub async fn full_scan(
         stats.source_files += src.files_indexed as u32;
         stats.source_chunks += src.chunks as u32;
         stats.source_skipped_other_corpus += src.skipped_other_corpus as u32;
+        stats.source_files_pruned += src.files_pruned as u32;
         stats.extract_source_ms += src.elapsed_ms;
+        source_bytes_hint += src.files_tracked as i64;
+    }
+    // Recorded like the other four extractors so `check().extractors_last_run_ms`
+    // carries `extract.source` too (it listed only four of six corpora before).
+    source_op
+        .complete(
+            pool,
+            Some(source_bytes_hint),
+            Some(stats.source_chunks as i64),
+            json!({
+                "files": stats.source_files,
+                "chunks": stats.source_chunks,
+                "pruned": stats.source_files_pruned,
+                "skipped_other_corpus": stats.source_skipped_other_corpus,
+            }),
+        )
+        .await?;
+
+    // 6. session transcripts (the `find_session` corpus). Runs LAST because the
+    // session→commit binding resolves against `commit_entries` from step 4.
+    //
+    // This is folded in rather than left to `index-sessions` because a corpus a
+    // user has to know to populate is a corpus that stays empty: the README
+    // quickstart's `find_session` returned nothing for anyone who had only run
+    // `nibdex index`. Scope is DERIVED from the workspace root, never a flag —
+    // see `SessionScope::Workspace`.
+    let session_started = Instant::now();
+    let session_op = Op::start("extract.session_edges");
+    let projects = projects_dir
+        .map(PathBuf::from)
+        .or_else(session_index::default_projects_dir);
+    match projects {
+        Some(projects_dir) if projects_dir.is_dir() => {
+            // NON-FATAL BY DESIGN, and the second half of a defence the file-level
+            // skip already covers. Five corpora have committed by the time this
+            // runs; failing the whole scan over the newest and most fragile one
+            // would report total failure for a mostly-successful index and leave
+            // the caller with a half-populated db and no summary explaining it.
+            //
+            // Reported, never swallowed: the reason lands in `stats` and prints in
+            // the CLI summary. Diagnosed is the floor — the same bar the
+            // `corpus_empty` work sets on the query side.
+            match session_index::index_sessions(
+                pool,
+                &projects_dir,
+                session_index::SessionScope::Workspace,
+                false, // additive merge — a re-index must never drop indexed edges
+                &workspace,
+                domain,
+            )
+            .await
+            {
+                Ok(sess) => {
+                    stats.session_edges = sess.edges_indexed as u32;
+                    stats.session_transcripts = sess.transcripts_seen as u32;
+                    stats.session_edges_dropped_foreign_workspace =
+                        sess.edges_dropped_foreign_workspace as u32;
+                    stats.session_edges_dropped_foreign_target =
+                        sess.edges_dropped_foreign_target as u32;
+                    stats.session_transcripts_unreadable = sess.transcripts_unreadable as u32;
+                    stats.session_edges_skipped_no_timestamp = sess.edges_skipped_no_timestamp as u32;
+                    stats.session_edges_already_indexed = sess.edges_duplicate as u32;
+                    stats.session_edges_late_bound = sess.edges_late_bound as u32;
+                }
+                Err(e) => {
+                    stats.session_index_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+        // No transcript root (no $HOME, or Claude Code was never run here). Not an
+        // error — the other five corpora are unaffected, and `check()` reports the
+        // empty session corpus.
+        _ => {}
+    }
+    stats.extract_session_edges_ms = session_started.elapsed().as_millis();
+    match &stats.session_index_error {
+        Some(e) => {
+            session_op.complete_err(pool, e).await?;
+        }
+        None => {
+            session_op
+                .complete(
+                    pool,
+                    Some(stats.session_transcripts as i64),
+                    Some(stats.session_edges as i64),
+                    json!({
+                        "transcripts": stats.session_transcripts,
+                        "new_edges": stats.session_edges,
+                        "already_indexed": stats.session_edges_already_indexed,
+                    }),
+                )
+                .await?;
+        }
     }
 
     stats.elapsed_ms = started.elapsed().as_millis();
@@ -294,7 +438,20 @@ pub async fn full_scan(
                 "files": stats.source_files,
                 "chunks": stats.source_chunks,
                 "skipped_other_corpus": stats.source_skipped_other_corpus,
+                "pruned": stats.source_files_pruned,
                 "duration_ms": stats.extract_source_ms,
+            },
+            "session_edges": {
+                "rows": stats.session_edges,
+                "transcripts": stats.session_transcripts,
+                "transcripts_unreadable": stats.session_transcripts_unreadable,
+                "skipped_no_timestamp": stats.session_edges_skipped_no_timestamp,
+                "already_indexed": stats.session_edges_already_indexed,
+                "late_bound": stats.session_edges_late_bound,
+                "dropped_foreign_workspace": stats.session_edges_dropped_foreign_workspace,
+                "dropped_foreign_target": stats.session_edges_dropped_foreign_target,
+                "error": stats.session_index_error,
+                "duration_ms": stats.extract_session_edges_ms,
             },
         },
     });
@@ -304,8 +461,39 @@ pub async fn full_scan(
     Ok(stats)
 }
 
-fn walk_markdown(root: &Path) -> Vec<PathBuf> {
+/// Is `path` (a file or dir directly under `anchor`) really INSIDE `anchor` once
+/// symlinks are resolved? A symlink is admitted only when its canonical target
+/// is under the canonical anchor. Everything the indexer reads beneath a kept
+/// anchor must satisfy this: in domain mode the domain filter runs on anchor
+/// ROOTS, so a symlink under a labeled dir pointing at another domain's tree
+/// (`acme/docs -> ../beta/docs`, `acme/notes.md -> ../beta/plan.md`) used to
+/// pull that tree's content into this domain's db — the isolation the README
+/// calls "physically absent" was one `ln -s` away from false (RC1 review 1.2).
+/// Non-symlinks pass without a canonicalize (they cannot escape the anchor).
+pub(crate) fn stays_within(anchor: &Path, path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return true;
+    }
+    let (Ok(anchor_c), Ok(target_c)) = (anchor.canonicalize(), path.canonicalize()) else {
+        return false;
+    };
+    target_c.starts_with(&anchor_c)
+}
+
+/// Recursive `*.md` walk under `root` — which must itself be a real directory
+/// under `anchor` (a symlinked `docs/` is skipped by `stays_within`, since
+/// walkdir follows the ROOT link even with `follow_links(false)`). Symlinked
+/// files/dirs beneath are not followed (walkdir default), so nothing under a
+/// kept root can read outside it.
+fn walk_markdown(anchor: &Path, root: &Path) -> Vec<PathBuf> {
+    if !stays_within(anchor, root) {
+        return Vec::new();
+    }
     WalkDir::new(root)
+        .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_map(|e| e.ok())
@@ -333,6 +521,9 @@ fn list_root_markdown(anchor: &Path) -> Vec<PathBuf> {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_file())
+            // `is_file()` follows symlinks; admit a link only if it resolves
+            // inside the anchor (RC1 review 1.2 — see `stays_within`).
+            .filter(|p| stays_within(anchor, p))
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
             .filter(|p| p.file_name().and_then(|s| s.to_str()) != Some("CLAUDE.md"))
             .collect(),
@@ -495,7 +686,9 @@ async fn run_memory_extractor(pool: &SqlitePool, mem_dir: &Path) -> Result<Memor
     let mut skipped: u32 = 0;
     let mut total_bytes: i64 = 0;
 
-    for path in walk_markdown(mem_dir) {
+    // Anchor = the dir itself: a memory dir that is a symlink (dotfiles setups)
+    // is fine, links BENEATH it are not followed.
+    for path in walk_markdown(mem_dir, mem_dir) {
         let document_id = upsert_document(pool, &path, "memory").await?;
         files_seen += 1;
         let outcome = extract_memory_file_into_db(pool, document_id, &path).await?;
@@ -547,7 +740,7 @@ async fn run_design_doc_extractor(
     let mut paths = list_root_markdown(anchor);
     let docs = anchor.join("docs");
     if docs.exists() {
-        paths.extend(walk_markdown(&docs));
+        paths.extend(walk_markdown(anchor, &docs));
     }
     paths.sort();
     paths.dedup();
@@ -1000,12 +1193,16 @@ async fn index_one_repo(
 /// via a `.git/HEAD` or `.git/refs/heads/**` event (D-6.2.4). Wraps
 /// `index_one_repo` in `Op::start("watcher.reindex_commits")` so per-event
 /// work shows up in `op_measurements` distinct from the full-scan baseline.
-/// Uses the conservative Day 4 cap (50,000) to defend against pathological
-/// histories at first-touch.
-pub async fn reindex_commits_for_repo(pool: &SqlitePool, repo_path: &Path) -> Result<()> {
+/// `max_commits_per_repo` is the daemon's `--max-commits-per-repo` (defaults to
+/// the same 50,000 as `nibdex index`) — previously hard-wired to the default
+/// regardless of the flag (RC1 review, sev-2).
+pub async fn reindex_commits_for_repo(
+    pool: &SqlitePool,
+    repo_path: &Path,
+    max_commits_per_repo: usize,
+) -> Result<()> {
     let op = Op::start("watcher.reindex_commits");
-    let outcome =
-        index_one_repo(pool, repo_path, GitOptions::default().max_commits_per_repo).await?;
+    let outcome = index_one_repo(pool, repo_path, max_commits_per_repo).await?;
     op.complete(
         pool,
         None,
@@ -1326,7 +1523,7 @@ mod tests {
             .unwrap();
         }
 
-        let stats = full_scan(&pool, root, None, GitOptions::default(), None)
+        let stats = full_scan(&pool, root, None, Some(&root.join(".no-transcripts")), GitOptions::default(), None)
             .await
             .unwrap();
 
@@ -1338,6 +1535,80 @@ mod tests {
             "expected >=4 sections (1 doc heading + 2 sections × 2 docs); got {}",
             stats.design_sections,
         );
+    }
+
+    /// RC1 review 1.2 — the domain invariant survives SYMLINKS. A labeled dir that
+    /// links into another domain's tree (a tracked file link, a root `*.md` link,
+    /// a `docs/` link, a `CLAUDE.md` link) must not pull that tree's content into
+    /// this domain's db, in any of the three file corpora. Before `stays_within`
+    /// and the source-side symlink skip, all four leaked. Mutation this catches:
+    /// removing any one of the four guards → its needle appears in alpha.db.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_domain_isolation_is_not_defeated_by_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let root = root.as_path();
+        // beta: the victim tree — a repo with a secret source file, docs, a root md, a CLAUDE.md.
+        let beta = root.join("beta");
+        std::fs::create_dir_all(beta.join("docs")).unwrap();
+        std::fs::write(beta.join("secret.rs"), "pub const BETASECRET_TOKEN_ZZ: u8 = 1;").unwrap();
+        std::fs::write(beta.join("docs").join("plan.md"), "# Plan\n\nBETADOC_NEEDLE_ZZ here.\n").unwrap();
+        std::fs::write(beta.join("ROADMAP.md"), "# Roadmap\n\nBETAROOT_NEEDLE_ZZ here.\n").unwrap();
+        std::fs::write(
+            beta.join("CLAUDE.md"),
+            "# beta\n\n## Recent session history\n\n### #1 — 2026-01-01\n- BETACLAUDE_NEEDLE_ZZ\n",
+        )
+        .unwrap();
+        // acme: the labeled dir — a repo whose tracked file, docs dir, root md and
+        // CLAUDE.md are ALL symlinks into beta.
+        let acme = root.join("acme");
+        std::fs::create_dir_all(&acme).unwrap();
+        symlink(beta.join("secret.rs"), acme.join("leak.rs")).unwrap();
+        symlink(beta.join("docs"), acme.join("docs")).unwrap();
+        symlink(beta.join("ROADMAP.md"), acme.join("notes.md")).unwrap();
+        symlink(beta.join("CLAUDE.md"), acme.join("CLAUDE.md")).unwrap();
+        std::fs::write(acme.join("own.rs"), "pub fn acme_own_fn() {}").unwrap();
+        let repo = git2::Repository::init(&acme).unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(Path::new("leak.rs")).unwrap();
+        idx.add_path(Path::new("own.rs")).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "acme initial", &tree, &[]).unwrap();
+        std::fs::write(
+            root.join(".nibdex-domains.toml"),
+            "[domains]\nalpha = [\"acme\"]\nother = [\"beta\"]\n",
+        )
+        .unwrap();
+
+        let alpha = fresh_pool().await;
+        let stats = full_scan(&alpha, root, None, Some(&root.join(".no-transcripts")), GitOptions::default(), Some("alpha"))
+            .await
+            .unwrap();
+        assert!(stats.source_files >= 1, "acme's own file is indexed");
+
+        for needle in ["BETASECRET_TOKEN_ZZ", "BETADOC_NEEDLE_ZZ", "BETAROOT_NEEDLE_ZZ", "BETACLAUDE_NEEDLE_ZZ"] {
+            let hits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM search_index WHERE body MATCH ?")
+                .bind(needle)
+                .fetch_one(&alpha)
+                .await
+                .unwrap();
+            assert_eq!(hits, 0, "alpha.db holds beta's {needle} via a symlink under acme/");
+        }
+        let own: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM search_index WHERE body MATCH 'acme_own_fn'")
+            .fetch_one(&alpha)
+            .await
+            .unwrap();
+        assert_eq!(own, 1, "acme's real file is still indexed");
+        let leaked_paths: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM documents WHERE path LIKE '%beta%'")
+                .fetch_all(&alpha)
+                .await
+                .unwrap();
+        assert!(leaked_paths.is_empty(), "no beta path in alpha.db: {leaked_paths:?}");
     }
 
     /// SESSION_SCOPE_DESIGN §0 — the domain-isolation INVARIANT: a `--domain` pass
@@ -1373,11 +1644,11 @@ mod tests {
 
         // Index each domain into its own db.
         let alpha = fresh_pool().await;
-        full_scan(&alpha, root, None, GitOptions::default(), Some("alpha"))
+        full_scan(&alpha, root, None, Some(&root.join(".no-transcripts")), GitOptions::default(), Some("alpha"))
             .await
             .unwrap();
         let beta = fresh_pool().await;
-        full_scan(&beta, root, None, GitOptions::default(), Some("beta"))
+        full_scan(&beta, root, None, Some(&root.join(".no-transcripts")), GitOptions::default(), Some("beta"))
             .await
             .unwrap();
 
@@ -1404,6 +1675,121 @@ mod tests {
         assert_eq!(mentions(&alpha, "proj-b").await, 0, "alpha.db must NOT contain proj-b");
         assert!(mentions(&beta, "proj-b").await > 0, "beta.db must contain proj-b");
         assert_eq!(mentions(&beta, "proj-a").await, 0, "beta.db must NOT contain proj-a");
+    }
+
+    // ============ LABEL-DEPTH SPECS — BULK CORPORA (source + commits) ============
+    // docs/LABEL_DEPTH_DESIGN.md. The session-side specs live in session_index.rs
+    // and cover edges + taint; these cover what `full_scan` admits, which is where
+    // D6's "indexed by nobody" claim actually has to hold -- the leak was measured
+    // here, with the foreign repo's source AND its entire commit history landing in
+    // alpha.db. Implemented 2026-07-23; these now run in the release gate.
+    //
+    // NOTE the flag: nested repos are only DISCOVERABLE with `--include-nested-repos`
+    // (NestedMode::Include). That is not an exotic setting — the workspace-container
+    // layout REQUIRES it (nibdex commit 48fee0b) and the personal box's launchd plist
+    // carries it. So the same flag that makes a legitimate nested project visible is
+    // what makes a foreign nested repo admissible. A decoy run under the default
+    // Skip mode would prove nothing.
+
+    /// Sweep every bulk surface a nested repo could reach: document + chunk paths,
+    /// chunk bodies, and commit repo/message/files. Path-only counting would miss
+    /// content whose path happens not to carry the needle.
+    async fn bulk_needle_hits(pool: &SqlitePool, needle: &str) -> i64 {
+        let pat = format!("%{needle}%");
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT COUNT(*) FROM documents WHERE path LIKE ?) \
+             + (SELECT COUNT(*) FROM source_chunks WHERE path LIKE ? OR body LIKE ?) \
+             + (SELECT COUNT(*) FROM commit_entries WHERE repo_path LIKE ? \
+                  OR message_summary LIKE ? OR IFNULL(message_body,'') LIKE ? \
+                  OR IFNULL(files_changed,'') LIKE ?)",
+        )
+        .bind(&pat).bind(&pat).bind(&pat).bind(&pat).bind(&pat).bind(&pat).bind(&pat)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A git repo at `dir` holding one committed file.
+    fn repo_with(dir: &Path, file: &str, body: &str, msg: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let repo = git2::Repository::init(dir).unwrap();
+        std::fs::write(dir.join(file), body).unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(Path::new(file)).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[]).unwrap();
+    }
+
+    /// A workspace whose labeled `proj-a` contains a FOREIGN repo one level down.
+    fn depth_bulk_ws(config: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        repo_with(&root.join("proj-a"), "alpha.rs", "pub fn alpha_widget() {}", "proj-a: alpha");
+        repo_with(
+            &root.join("proj-a/nested"),
+            "secret.rs",
+            "pub fn vendor_secret_token() {}",
+            "nested: vendor_secret_token wiring",
+        );
+        std::fs::write(root.join(".nibdex-domains.toml"), config).unwrap();
+        tmp
+    }
+
+    async fn scan_domain(root: &Path, domain: &str) -> SqlitePool {
+        let pool = fresh_pool().await;
+        let opts = GitOptions { nested_mode: NestedMode::Include, ..Default::default() };
+        full_scan(&pool, root, None, Some(&root.join(".no-transcripts")), opts, Some(domain)).await.unwrap();
+        pool
+    }
+
+    /// D6 (bulk) — an unlabeled nested repo under a labeled parent must reach NO
+    /// database. Today `top_subdir` reads `proj-a` and admits its source and its
+    /// entire commit history into alpha.
+    #[tokio::test]
+    async fn depth_spec_bulk_unlabeled_nested_repo_is_quarantined() {
+        let tmp = depth_bulk_ws("[domains]\nalpha = [\"proj-a\"]\n");
+        let alpha = scan_domain(tmp.path(), "alpha").await;
+        assert!(bulk_needle_hits(&alpha, "alpha_widget").await > 0, "the parent is still indexed");
+        for needle in ["vendor_secret_token", "nested"] {
+            assert_eq!(
+                bulk_needle_hits(&alpha, needle).await,
+                0,
+                "alpha.db holds {needle} from an unlabeled nested repo"
+            );
+        }
+    }
+
+    /// D3/D4 (bulk) — an explicitly withdrawn nested tree reaches no database
+    /// either, which is the case where the owning domain does not exist here.
+    #[tokio::test]
+    async fn depth_spec_bulk_withdrawn_nested_repo_reaches_no_domain() {
+        let tmp = depth_bulk_ws(
+            "[domains]\nalpha = [\"proj-a\"]\n\n\
+             [unassigned]\nacknowledged = [\"proj-a/nested\"]\n",
+        );
+        let alpha = scan_domain(tmp.path(), "alpha").await;
+        assert!(bulk_needle_hits(&alpha, "alpha_widget").await > 0);
+        assert_eq!(
+            bulk_needle_hits(&alpha, "vendor_secret_token").await,
+            0,
+            "a withdrawn nested tree must not be indexed"
+        );
+    }
+
+    /// D6 continuity (bulk) — the `learn/python-sandbox` case. Once labeled for
+    /// its parent's own domain the nested repo is fully indexed again. This must
+    /// pass BOTH before and after the depth work: it is the mutation guard
+    /// against a "fix" that simply excludes every nested repo.
+    #[tokio::test]
+    async fn depth_spec_bulk_labeled_nested_repo_is_restored() {
+        let tmp = depth_bulk_ws("[domains]\nalpha = [\"proj-a\", \"proj-a/nested\"]\n");
+        let alpha = scan_domain(tmp.path(), "alpha").await;
+        assert!(
+            bulk_needle_hits(&alpha, "vendor_secret_token").await > 0,
+            "a nested repo labeled for its own domain must be indexed"
+        );
     }
 
     /// D1 gear-6 fix: design docs directly under `docs/` (NOT a `docs/design/`
@@ -1433,7 +1819,7 @@ mod tests {
         )
         .unwrap();
 
-        let stats = full_scan(&pool, root, None, GitOptions::default(), None)
+        let stats = full_scan(&pool, root, None, Some(&root.join(".no-transcripts")), GitOptions::default(), None)
             .await
             .unwrap();
 
@@ -1469,7 +1855,7 @@ mod tests {
         std::fs::create_dir_all(&docs).unwrap();
         std::fs::write(docs.join("DESIGN.md"), "# Design\n\n## Goals\n\ngoals body\n").unwrap();
 
-        let stats = full_scan(&pool, root, None, GitOptions::default(), None)
+        let stats = full_scan(&pool, root, None, Some(&root.join(".no-transcripts")), GitOptions::default(), None)
             .await
             .unwrap();
 
@@ -1511,5 +1897,297 @@ mod tests {
         .await
         .unwrap();
         assert!(triage_hits >= 1, "BUG_TRIAGE.md content is FTS-searchable via find_design_doc");
+    }
+
+    /// THE public defect this closes: a new user follows the README quickstart,
+    /// runs `nibdex index`, calls `find_session` — and gets nothing, because the
+    /// transcript corpus only ever populated from a separate command they had no
+    /// reason to know existed. One `full_scan`, no flags, must leave the session
+    /// corpus searchable.
+    ///
+    /// The fixture also carries a second workspace's transcript in a sibling slug,
+    /// so the test proves the scope is DERIVED (not "whatever was in the projects
+    /// dir") in the same pass.
+    #[tokio::test]
+    async fn full_scan_indexes_this_workspaces_session_edges() {
+        use serde_json::{json, Value};
+
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git2::Repository::init(&root).unwrap();
+        let foreign_tmp = tempfile::tempdir().unwrap();
+        let foreign = foreign_tmp.path().canonicalize().unwrap();
+
+        let transcript = |cwd: &std::path::Path, session: &str, rationale: &str| -> String {
+            let v: Value = json!({
+                "type": "assistant",
+                "sessionId": session,
+                "uuid": format!("{session}-u1"),
+                "cwd": cwd.to_string_lossy(),
+                "gitBranch": "main",
+                "timestamp": "2026-08-14T10:00:00.000Z",
+                "message": { "id": format!("{session}-g1"), "content": [
+                    {"type": "text", "text": rationale},
+                    {"type": "tool_use", "name": "Edit",
+                     "input": {"file_path": cwd.join("src/lib.rs").to_string_lossy()}}
+                ]}
+            });
+            v.to_string()
+        };
+
+        let projects = tmp.path().join("projects");
+        for (slug, cwd, session, rationale) in [
+            ("-ws", root.as_path(), "mine", "wire the debouncer to the watcher"),
+            (
+                "-employer",
+                foreign.as_path(),
+                "theirs",
+                "rotate the acmecorp billing token",
+            ),
+        ] {
+            let d = projects.join(slug);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("s.jsonl"), transcript(cwd, session, rationale)).unwrap();
+        }
+
+        let stats = full_scan(&pool, &root, None, Some(&projects), GitOptions::default(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.session_transcripts, 2, "both slugs read");
+        assert_eq!(stats.session_edges, 1, "only this workspace's edge indexed");
+        assert_eq!(stats.session_edges_dropped_foreign_workspace, 1);
+
+        // The corpus `find_session` reads is populated and searchable BY RATIONALE
+        // — the whole point of the transcript corpus over a path parser.
+        let hits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM search_index WHERE source_table = 'session_edges' \
+             AND search_index MATCH 'debouncer'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(hits >= 1, "find_session corpus is empty after a plain `nibdex index`");
+
+        // ... and the other workspace's rationale is nowhere in the db.
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_edges WHERE rationale LIKE '%acmecorp%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leaked, 0);
+    }
+
+    /// A session-pass failure must NOT discard the five corpora that already
+    /// committed. Before this, an error here propagated out of `full_scan`, so
+    /// `nibdex index` exited non-zero with a half-populated database and printed
+    /// no summary — reporting total failure for a mostly-successful index.
+    ///
+    /// Triggered with an UNREADABLE transcript root: `is_dir()` still passes, so
+    /// the pass is attempted, and the `read_dir` inside it fails. That is a real
+    /// shape (a root owned by another user, or one racing a permission change),
+    /// not a contrived one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_survives_a_failing_session_pass() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git2::Repository::init(root).unwrap();
+        std::fs::write(root.join("README.md"), "# R\n\n## Usage\n\nbody\n").unwrap();
+
+        let projects = root.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root ignores the mode bits, so the condition cannot be expressed here.
+        // Say so and stop rather than assert something the environment isn't doing.
+        if std::fs::read_dir(&projects).is_ok() {
+            let _ = std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755));
+            eprintln!("skipping: this environment can read a 0o000 dir (running as root?)");
+            return;
+        }
+
+        let stats = full_scan(&pool, root, None, Some(&projects), GitOptions::default(), None)
+            .await
+            .expect("a failing session pass must not fail the whole scan");
+
+        // Restore before the tempdir teardown, which needs to descend into it.
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(stats.design_doc, 1, "the other corpora still indexed");
+        assert_eq!(stats.session_edges, 0);
+        assert!(
+            stats.session_index_error.is_some(),
+            "the failure must be REPORTED, not silently swallowed"
+        );
+    }
+
+    /// `nibdex index --domain X` must isolate the SESSION corpus per domain, not
+    /// just source and commits.
+    ///
+    /// This had no gate at all, and the blind spot was self-inflicted: folding
+    /// session indexing into `full_scan` meant every pre-existing domain test
+    /// suddenly ran it, so they were all pointed at an absent transcript root to
+    /// keep them focused — which left the newly-reachable domain path executed by
+    /// nothing. Dropping `domain` from the `index_sessions` call kept the whole
+    /// suite green. Per-domain isolation is this project's central security
+    /// claim; it cannot rest on a fixture that never reaches the code.
+    #[tokio::test]
+    async fn full_scan_isolates_session_edges_per_domain() {
+        use serde_json::{json, Value};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for sub in ["alpha-proj", "beta-proj"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+            std::fs::write(root.join(sub).join("x.rs"), "fn x() {}").unwrap();
+        }
+        std::fs::write(
+            root.join(".nibdex-domains.toml"),
+            "[domains]\nalpha = [\"alpha-proj\"]\nbeta = [\"beta-proj\"]\n",
+        )
+        .unwrap();
+
+        // ONE session that edits both domains' trees.
+        let mut ts = 0;
+        let mut line = |uuid: &str, target: std::path::PathBuf, note: &str| -> Value {
+            ts += 1;
+            json!({
+                "type": "assistant",
+                "sessionId": "s1",
+                "uuid": uuid,
+                "cwd": root.to_string_lossy(),
+                "timestamp": format!("2026-08-14T13:00:{ts:02}.000Z"),
+                "message": { "id": format!("g{ts}"), "content": [
+                    {"type": "text", "text": note},
+                    {"type": "tool_use", "name": "Edit",
+                     "input": {"file_path": target.to_string_lossy()}}
+                ]}
+            })
+        };
+        let lines = [
+            line("u1", root.join("alpha-proj/x.rs"), "alpha_needle work"),
+            line("u2", root.join("beta-proj/x.rs"), "beta_needle work"),
+        ];
+        let projects = root.join("projects");
+        std::fs::create_dir_all(projects.join("-ws")).unwrap();
+        std::fs::write(
+            projects.join("-ws").join("s.jsonl"),
+            lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"),
+        )
+        .unwrap();
+
+        let alpha = fresh_pool().await;
+        full_scan(&alpha, &root, None, Some(&projects), GitOptions::default(), Some("alpha"))
+            .await
+            .unwrap();
+
+        let paths: Vec<String> =
+            sqlx::query_scalar("SELECT file_path FROM session_edges").fetch_all(&alpha).await.unwrap();
+        assert_eq!(paths.len(), 1, "alpha.db must hold only alpha's edit");
+        assert!(paths[0].contains("alpha-proj"), "got {paths:?}");
+
+        // THE INVARIANT: beta's needle appears nowhere in alpha's database —
+        // not in a path, not in a rationale, not in the FTS body.
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM search_index WHERE source_table = 'session_edges' \
+             AND search_index MATCH 'beta_needle'",
+        )
+        .fetch_one(&alpha)
+        .await
+        .unwrap();
+        assert_eq!(leaked, 0, "beta content leaked into alpha.db via the session pass");
+    }
+
+    /// A re-index must never DROP already-indexed edges.
+    ///
+    /// Claude Code prunes transcripts (~30 days), so the additive merge is what
+    /// keeps an edge after its source transcript is gone. `full_scan` passes
+    /// `rebuild = false` to guarantee that, and flipping it to `true` kept the
+    /// whole suite green — a silent data-loss path guarded only by a comment.
+    #[tokio::test]
+    async fn full_scan_never_drops_edges_whose_transcript_has_rotated_away() {
+        use serde_json::{json, Value};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}").unwrap();
+
+        let line: Value = json!({
+            "type": "assistant",
+            "sessionId": "s1",
+            "uuid": "u1",
+            "cwd": root.to_string_lossy(),
+            "timestamp": "2026-08-14T14:00:00.000Z",
+            "message": { "id": "g1", "content": [
+                {"type": "text", "text": "keepme rotated away"},
+                {"type": "tool_use", "name": "Edit",
+                 "input": {"file_path": root.join("a.rs").to_string_lossy()}}
+            ]}
+        });
+        let projects = root.join("projects");
+        std::fs::create_dir_all(projects.join("-ws")).unwrap();
+        let transcript = projects.join("-ws").join("s.jsonl");
+        std::fs::write(&transcript, line.to_string()).unwrap();
+
+        let pool = fresh_pool().await;
+        let first = full_scan(&pool, &root, None, Some(&projects), GitOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(first.session_edges, 1);
+
+        // Claude Code prunes the transcript, exactly as it does at ~30 days.
+        std::fs::remove_file(&transcript).unwrap();
+
+        let second = full_scan(&pool, &root, None, Some(&projects), GitOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(second.session_transcripts, 0, "the source really is gone");
+
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_edges")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1, "a re-index wiped an edge whose transcript had rotated away");
+        let fts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM search_index WHERE source_table = 'session_edges'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fts, 1, "its FTS row must survive too, or it is unfindable");
+    }
+
+    /// A machine with no transcript root at all (Claude Code never run, or no
+    /// `$HOME`) must still index the other five corpora. The session corpus being
+    /// empty is a fact to report, never a reason to fail the scan.
+    #[tokio::test]
+    async fn full_scan_survives_a_missing_transcript_root() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git2::Repository::init(root).unwrap();
+        std::fs::write(root.join("README.md"), "# R\n\n## Usage\n\nbody\n").unwrap();
+
+        let stats = full_scan(
+            &pool,
+            root,
+            None,
+            Some(&root.join("definitely-not-here")),
+            GitOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.session_edges, 0);
+        assert_eq!(stats.session_transcripts, 0);
+        assert_eq!(stats.design_doc, 1, "the other corpora are unaffected");
     }
 }

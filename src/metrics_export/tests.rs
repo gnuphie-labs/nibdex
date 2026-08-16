@@ -311,6 +311,7 @@ fn scrub_snapshot_drops_unsafe_map_keys() {
             session_entries: 0,
             memory_entries: 0,
             design_doc_sections: 0,
+            source_chunks: 0,
             indexed_repos: 0,
         },
         shallow_repos: vec![],
@@ -323,6 +324,8 @@ fn scrub_snapshot_drops_unsafe_map_keys() {
         extractors_last_run_ms: BTreeMap::new(),
         cost_savings: None,
         build: crate::build_info::build_info(),
+        retired_corpora: None,
+        adoption: None,
     };
 
     let (snap, dropped) = scrub_snapshot(&check);
@@ -433,6 +436,7 @@ fn drift_check_result_fields_are_all_classified() {
             session_entries: 0,
             memory_entries: 0,
             design_doc_sections: 0,
+            source_chunks: 0,
             indexed_repos: 0,
         },
         shallow_repos: vec!["/path/to/repo".to_string()],
@@ -452,6 +456,25 @@ fn drift_check_result_fields_are_all_classified() {
             window_30d: window(),
         }),
         build: crate::build_info::build_info(),
+        // NON-EMPTY on purpose. `retired_corpora` is `skip_serializing_if`, so an
+        // empty fixture would vanish from the serialized value and this guard
+        // would pass without ever having seen the field — a drift test defeated
+        // by the very attribute that makes the field additive.
+        retired_corpora: Some(vec![crate::mcp::RetiredCorpus {
+            corpus: "session_entries".to_string(),
+            rows: 1,
+            superseded_by: "session_edges".to_string(),
+        }]),
+        // Populated for the same reason `retired_corpora` is: the field is
+        // `skip_serializing_if`, so a `None` fixture would vanish from the
+        // serialized value and this guard would pass without ever seeing it.
+        adoption: Some(crate::mcp::Adoption {
+            sessions_seen: 10,
+            sessions_using_nibdex: 0,
+            retrieval_elsewhere: 470,
+            nibdex_queries: 0,
+            nibdex_share_pct: 0.0,
+        }),
     };
     let v = serde_json::to_value(&check).unwrap();
 
@@ -464,6 +487,14 @@ fn drift_check_result_fields_are_all_classified() {
             // guard stays exhaustive) but never construct-fresh'd into the
             // export payload (see scrub_snapshot).
             "build",
+            // `retired_corpora` likewise DROP: a health/interrogation surface
+            // naming dead tables, not a metrics signal.
+            "retired_corpora",
+            // `adoption` DROP *for now* — see the spec row. It is IP-free
+            // (counts only) and is arguably the most useful field a field
+            // install could report, but widening the attested payload is a
+            // deliberate decision, not a side effect of adding a field.
+            "adoption",
         ]),
         "CheckResult fields drifted from METRICS_EXPORT_SPEC §4.2"
     );
@@ -478,7 +509,7 @@ fn drift_check_result_fields_are_all_classified() {
     );
     assert_eq!(
         keys(&v["orphans"]),
-        expected(&["session_entries", "memory_entries", "design_doc_sections", "indexed_repos"]),
+        expected(&["session_entries", "memory_entries", "design_doc_sections", "source_chunks", "indexed_repos"]),
         "OrphanCounts drifted"
     );
     assert_eq!(

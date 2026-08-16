@@ -21,13 +21,22 @@ These are scope-fence items from DESIGN §6. Including them in proposals is a re
 
 ## 2. Known operational limits in the current release
 
-### Query syntax is raw FTS5 — hyphens are the NOT operator
+### Query syntax is FTS5, and some punctuation still bites
 
-The `query` parameter on all `find_*` tools is passed to SQLite FTS5 as a `MATCH` expression unchanged (DESIGN D-6.1.4). FTS5 treats `-` as the NOT operator, so `find_commit(query: "fan-out")` parses as `fan NOT out` and errors with `no such column: out`.
+The `query` parameter on all `find_*` tools is an FTS5 `MATCH` expression. nibdex does **not** pass it through untouched: any whitespace-separated token containing a character FTS5's parser would choke on is wrapped in a phrase literal before the query runs. So `find_commit(query: "fan-out")` searches for the phrase `fan-out` and returns results rather than erroring — the hyphen is not treated as a NOT operator.
 
-**Workaround:** quote the term — `find_commit(query: "\"fan-out\"")` matches the phrase verbatim.
+Power-user syntax still works, because the wrapping is per-token and leaves FTS5's own grammar alone: `bb8 AND pool`, `"exact phrase"`, and `prefix*` all behave as FTS5 defines them.
 
-**Why we don't auto-quote:** the tool intentionally exposes raw FTS5 semantics so power-user queries (`bb8 AND pool`, `"exact phrase"`, `prefix*`) work without translation. Auto-quoting would hide the operator without solving the underlying mismatch between natural-language compounds and FTS5 grammar. A future minor bump may surface FTS5 syntax errors as structured JSON-RPC errors with a hint, or add a `mode: "phrase"` parameter.
+**What still bites.** Parentheses and commas are deliberately left unquoted, because they are FTS5 grouping syntax — so a query containing them can still fail:
+
+```
+find_code(query: "parse_config(")   →  error: fts5: syntax error near ""
+find_code(query: "foo(bar)")        →  error: fts5: syntax error near "foo"
+```
+
+Searching for a call site is an ordinary thing to want, so this is a real rough edge. **Workaround:** quote it yourself — `find_code(query: "\"parse_config(\"")` — or drop the punctuation and search `parse_config`.
+
+An FTS5 syntax error surfaces as a tool error whose text names the cause and the fix ("the query is not valid FTS5 MATCH syntax … wrap it in double quotes … This is a malformed query, NOT an empty or broken index"), so a client can tell malformed-query from broken-index. Auto-quoting the paren family is still deliberately not done — `( )` are grouping syntax a power user may mean.
 
 ### `--metrics-sink stdout` interleaves with stdio MCP transport
 
@@ -60,9 +69,21 @@ Every event in the cost ledger carries `calibration_confidence: "estimated"`. Th
 
 ### The session corpus is transcript-derived, and machine-specific
 
-`find_session` and `recent_sessions` are backed by the **session→code map** — `Edit`/`Write` actions recovered from your Claude Code transcripts via a separate `nibdex index-sessions` step (see the README). Two consequences: it's only as complete as your retained transcripts (recall starts at first index and grows forward — Claude Code prunes old transcripts, ~30 days by default), and it's inherently machine-specific, so unlike the other corpora it can't be reproduced from a clone.
+`find_session` and `recent_sessions` are backed by the **session→code map** — `Edit`/`Write` actions recovered from your Claude Code transcripts, built by `nibdex index` (see the README). Two consequences: it's only as complete as your retained transcripts (recall starts at first index and grows forward — Claude Code prunes old transcripts, ~30 days by default), and it's inherently machine-specific, so unlike the other corpora it can't be reproduced from a clone.
 
-**Legacy note.** Earlier nibdex parsed session entries from a specific `## Recent session history` CLAUDE.md shape into a `session_entries` corpus. That extractor still runs but **no query tool reads it** — the transcript map replaced it — and it will be removed in a future release. If `find_session` comes back empty, the cause is almost always that `nibdex index-sessions` hasn't been run yet, not a CLAUDE.md-format mismatch.
+A third, subtler one: **the index only advances when you run `nibdex index`.** The file watcher does not yet watch the transcript directory, so a long-running daemon keeps serving whatever the last indexing pass captured — sessions since then are not in it. Re-run `nibdex index` (or `nibdex index-sessions --workspace-scoped`, which does only this corpus) to catch up. Watching transcripts live is planned.
+
+And a cost worth knowing about: **each pass re-reads every transcript**, including those belonging to other workspaces on the machine, which are parsed and then discarded by the scope rule. Indexing is additive, so nothing is rewritten — a re-run reports how many edges were new versus already indexed — but the *reading* is repeated. On the author's machine that is ~16 MB and ~50 ms; with a much larger transcript history it will be proportionally slower. Resuming from a stored offset instead of re-reading is a planned improvement, not something the current release does.
+
+**Legacy note.** Earlier nibdex parsed session entries from a specific `## Recent session history` CLAUDE.md shape into a `session_entries` corpus. That extractor still runs but **no query tool reads it** — the transcript map replaced it — and it will be removed in a future release. `check()` lists it under `retired_corpora` when it still holds rows, so a non-zero count there is not a sign of a damaged index. If `find_session` comes back empty, the response itself now tells you which case you are in: `corpus_empty: true` means nothing has been indexed, while `corpus_empty: false` (with `corpus_indexed_through`) means the corpus has content and your query simply missed it.
+
+### `find_code` indexes the working tree at index time; provenance is last-touch at HEAD
+
+The source corpus reads each git-tracked file **from the working tree** when `nibdex index` (or the watcher's on-commit reindex) runs — not the blob at HEAD. So an uncommitted edit that is on disk at index time is searchable, and its chunk still carries `commit_sha` = the commit that last touched that *file* at HEAD, which does not contain the uncommitted lines. `location: "verified"` means "the file has not changed since indexing", not "this content is committed". Read `commit_sha` as file-level last-touch provenance, and treat any hit whose text you cannot find in `git show <commit_sha>:<path>` as working-tree content. Indexing HEAD blobs instead is a design change under consideration.
+
+### The commit corpus keeps commits that history has rewritten
+
+Commits are added by walking HEAD and never removed. After `git commit --amend`, an interactive rebase, or a squash, the *pre-rewrite* commits stay in `commit_entries` alongside their replacements — `recent_commits` and `find_commit` return both, and `total_matched` counts both. This is deliberate for branch deletion (a deleted branch's commits are still history you may want to search) but is a real over-report after a rewrite. There is no `nibdex` command to purge them yet; deleting the db and re-running `nibdex index` is the reset. Source files that leave the git index *are* pruned on the next pass, and files deleted from disk but not yet from git show as `location: "file_missing"` and count under `check().orphans.source_chunks`.
 
 ### File-watcher is daemon-only
 
@@ -80,14 +101,23 @@ For cross-corpus terms, `find_commit("rustFetch")` ranks the densest occurrence 
 
 ### Always-on indexing requires `git2`-readable repositories
 
-The git-commits corpus uses `libgit2` (via the `git2` crate). Repositories whose layout `git2` cannot read (corrupted refs, partial clones with missing-but-referenced objects, non-standard packed-ref formats) are reported as "shallow" or skipped in `check().indexed_repos`. The `indexer` field surfaces this so you know coverage is partial; nothing is silently dropped.
+The git-commits corpus uses `libgit2` (via the `git2` crate). Shallow clones are flagged in `check().shallow_repos`. A repository `git2` cannot *open* at all (e.g. an empty or corrupted `.git` directory) currently fails the whole `nibdex index` run with the git2 error rather than being skipped — remove or repair it and re-run. Git *worktrees* and submodules (whose `.git` is a file, not a directory) are not discovered yet: a workspace made only of worktree checkouts indexes nothing. Both are known limits, not silent drops — the first is loud, the second shows as zero repos in `check()`.
 
 ### The IP-domain partition isolates artifacts, not sentences
 
 With `.nibdex-domains.toml` + `--domain`, a per-domain database is guaranteed — by a
 build-gating invariant test — to hold no **files, commits, design sections, or
-session edits** from another domain's tree, and no **rationale prose from a session
-that touched another domain's tree**. That guarantee is mechanical and needle-testable.
+session edits** from another domain's tree, and to withhold **rationale prose from
+the point a session first touches another domain's tree onward**. That guarantee is
+mechanical and needle-testable.
+
+The withholding is **forward-only**, which is a real limit and not a wording detail:
+rationale attached to edits made *before* that first cross point is kept verbatim, so
+prose looking ahead to work not yet started ("next I'll wire this into the acme
+flow") can still land in this domain's database even though the session later
+crossed. Order matters — two sessions with identical content but different edit
+order withhold differently. Whole-session retraction would close it and is not done:
+one stray read late in a long session would erase hours of legitimate rationale.
 
 What it does **not** do is judge what a sentence is *about*. A commit message or
 design note in a domain's own tree can name another domain and is indexed verbatim;
@@ -96,6 +126,26 @@ the other domain, taints nothing and is admitted. nibdex prevents mechanical
 commingling; it is not a semantic censor. The full CAN/CANNOT statement and the
 mitigation (context-separation discipline; separate workspaces for strict isolation)
 are in [SECURITY.md](../SECURITY.md#separating-ip-domains-multiple-clients-or-employers-on-one-machine).
+
+**Two things a domain database does not contain unless you act.** Workspace-**root**
+files belong to no labeled subdir, so no domain indexes them — silently, with no
+error. The fix is a convention: put cross-cutting docs in a subdir that is both
+labeled *and* its own git repository (the label routes it; the repo makes it a
+design-doc discovery anchor). Labeling a root file directly in the config does not
+work — discovery filters anchors before it reaches individual files. Separately, the
+**memory** corpus is skipped in domain mode unless a domain claims it via `[memory]`;
+that claim is an assertion nibdex cannot verify, since it can check a subdir against
+the filesystem but not what a memory note is about. Both are documented in
+[IP_DOMAINS.md](IP_DOMAINS.md#two-things-that-need-a-convention).
+
+**The ratchet does not fire on domain-less paths.** Files directly in the workspace
+root, this workspace's **own** `~/.claude` slug, and its own temp scratch belong to no
+domain and do not taint a session; an **unlabeled subdirectory does**, since that is
+how an unlabeled client tree looks. Not `~/.claude` or `/tmp` wholesale — those hold
+other workspaces' transcripts and client checkouts respectively. The exemption is by
+*location*, not content: a cross-client note at your workspace root will not withhold.
+This narrowing is measured — the earlier rule withheld 89.5% of reasoning on one
+single-domain machine, all false alarms (n=344 edges, one developer's box).
 
 Two finer edges of the withholding, both spelled out in SECURITY.md: the taint
 tracking watches **path-bearing tool inputs** (`Edit`/`Write`/`Read`/`Grep`/`Glob`/
@@ -110,8 +160,11 @@ are graded by plausibility under normal single-developer use.
 not re-index an unpartitioned db with `--domain`), and **narrowing** a domain's
 labels requires rebuilding that domain's db (indexing only adds; it never
 un-indexes a now-foreign row). Over-redaction — a session's rationale withheld
-because it read a workspace-root or another domain's file — is surfaced as a
-`rationales_withheld` count, not hidden.
+because it touched another domain's, or an unlabeled subdirectory's, file — is
+surfaced as a `rationales_withheld` count, not hidden. (One surprising case: a
+workspace-root path is neutral only while the file still *exists*. Relocate a root
+tracker and historical sessions that named it start tainting, since nibdex can no
+longer tell a deleted file from a deleted directory and fails narrow.)
 
 ### No telemetry — by design
 

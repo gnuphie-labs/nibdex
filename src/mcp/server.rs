@@ -22,6 +22,7 @@ use crate::metrics_sink::MetricsSink;
 
 use super::NibdexServer;
 use super::check::run_check;
+use super::fts5::explain_query_error;
 use super::query::*;
 use super::types::*;
 
@@ -127,7 +128,7 @@ impl NibdexServer {
                     &msg,
                 )
                 .await;
-                Err(format!("recent_sessions: {msg}"))
+                Err(format!("recent_sessions: {}", explain_query_error(&msg)))
             }
         }
     }
@@ -198,7 +199,7 @@ impl NibdexServer {
                     &msg,
                 )
                 .await;
-                Err(format!("find_session: {msg}"))
+                Err(format!("find_session: {}", explain_query_error(&msg)))
             }
         }
     }
@@ -272,7 +273,7 @@ impl NibdexServer {
                     &msg,
                 )
                 .await;
-                Err(format!("recent_commits: {msg}"))
+                Err(format!("recent_commits: {}", explain_query_error(&msg)))
             }
         }
     }
@@ -344,7 +345,7 @@ impl NibdexServer {
                     &msg,
                 )
                 .await;
-                Err(format!("find_commit: {msg}"))
+                Err(format!("find_commit: {}", explain_query_error(&msg)))
             }
         }
     }
@@ -409,7 +410,7 @@ impl NibdexServer {
                     &msg,
                 )
                 .await;
-                Err(format!("find_memory: {msg}"))
+                Err(format!("find_memory: {}", explain_query_error(&msg)))
             }
         }
     }
@@ -417,7 +418,7 @@ impl NibdexServer {
     /// Design-doc sections ranked by FTS5 relevance.
     #[tool(
         name = "find_design_doc",
-        description = "Search design-doc sections (docs/**/*.md) by FTS5 relevance. \
+        description = "Search design-doc sections (root-level *.md and docs/**/*.md, split by heading) by FTS5 relevance. \
                        `query` is a REQUIRED FTS5 MATCH expression against section body. \
                        Results ordered by bm25 rank ASC. `limit` defaults to 10, max 50."
     )]
@@ -474,7 +475,7 @@ impl NibdexServer {
                     &msg,
                 )
                 .await;
-                Err(format!("find_design_doc: {msg}"))
+                Err(format!("find_design_doc: {}", explain_query_error(&msg)))
             }
         }
     }
@@ -484,10 +485,14 @@ impl NibdexServer {
         name = "find_code",
         description = "Search indexed source code (git-tracked files, fixed line-window chunks) \
                        by FTS5 relevance. `query` is a REQUIRED FTS5 MATCH expression against \
-                       code body. Each hit returns path + line range + a bounded body excerpt \
-                       AND the commit that last touched it (the code↔commit→design/session \
-                       provenance join). Results ordered by bm25 rank ASC. `limit` defaults to \
-                       10, max 50."
+                       code body — raw FTS5 syntax, not natural language, so quote any term \
+                       containing punctuation (\"parse_config(\"). Each hit returns repo_path + \
+                       path + line range + a bounded body excerpt AND the commit that last \
+                       touched it (the code↔commit→design/session provenance join). `path` is \
+                       REPO-RELATIVE, so open a hit as repo_path + path. `repo` is an OPTIONAL \
+                       scope: a substring of the repo's absolute path (e.g. \"nibdex\"), the \
+                       same repo string find_commit/recent_commits take. Results ordered by \
+                       bm25 rank ASC. `limit` defaults to 10, max 50."
     )]
     pub async fn find_code(
         &self,
@@ -542,7 +547,7 @@ impl NibdexServer {
                     &msg,
                 )
                 .await;
-                Err(format!("find_code: {msg}"))
+                Err(format!("find_code: {}", explain_query_error(&msg)))
             }
         }
     }
@@ -553,7 +558,8 @@ impl NibdexServer {
         description = "Index health snapshot: document and entry counts, orphan classes, shallow repos, \
                        per-tool p50/p95 latency over the last hour, last extractor run times, and file-watcher state. \
                        Returns the D-6.3.3 schema_version=1 envelope. Orphan counts are computed live from the \
-                       index — a class is orphaned when its parent document's source file (or repo) no longer exists on disk."
+                       index — a class is orphaned when its parent document's source file (or repo) no longer exists on disk \
+                       (memory, design-doc, source, session_entries, indexed_repos)."
     )]
     pub async fn check(
         &self,
