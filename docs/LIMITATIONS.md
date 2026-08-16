@@ -85,6 +85,26 @@ The source corpus reads each git-tracked file **from the working tree** when `ni
 
 Commits are added by walking HEAD and never removed. After `git commit --amend`, an interactive rebase, or a squash, the *pre-rewrite* commits stay in `commit_entries` alongside their replacements — `recent_commits` and `find_commit` return both, and `total_matched` counts both. This is deliberate for branch deletion (a deleted branch's commits are still history you may want to search) but is a real over-report after a rewrite. There is no `nibdex` command to purge them yet; deleting the db and re-running `nibdex index` is the reset. Source files that leave the git index *are* pruned on the next pass, and files deleted from disk but not yet from git show as `location: "file_missing"` and count under `check().orphans.source_chunks`.
 
+### The schema corpus is reachable only through the hook, which is Claude Code only
+
+There is no `find_schema` query tool. The schema corpus is delivered by
+`nibdex hook` when a shell command runs SQL, and by nothing else — so of the six
+corpora, five have a query tool and this one does not.
+
+That is a deliberate choice rather than an oversight, and the reasoning is worth
+stating because it may not apply to you. On the author's machine the MCP tools
+are held *deferred* by the client, so reaching one costs a lookup call that
+`grep` never pays, and essentially all real use arrives through the hook; adding
+an eighth tool would most likely have added an eighth thing nobody calls. The
+hook, meanwhile, speaks a Claude Code contract that other MCP clients have no
+equivalent for.
+
+**The consequence, plainly: on any client other than Claude Code you can index a
+schema dump and then have no way to read it.** If that is your situation, the
+corpus is not yet useful to you, and saying so is more honest than implying six
+corpora are equally reachable. A `find_schema` tool is a candidate for a later
+release; the query layer it would need already exists.
+
 ### File-watcher is daemon-only
 
 The `nibdex mcp` stdio transport does **not** spawn the watcher — the process exits at session end. Between sessions, the index reflects whatever the most recent `nibdex index` run captured.

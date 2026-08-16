@@ -397,10 +397,25 @@ pub struct Adoption {
     pub sessions_using_nibdex: i64,
     /// Retrieval calls that went elsewhere (built-in search tools, shell greps).
     pub retrieval_elsewhere: i64,
-    /// Retrieval calls that went to nibdex.
+    /// Retrieval calls that went to nibdex — MCP tool calls only.
     pub nibdex_queries: i64,
-    /// nibdex's share of all retrieval, as a percentage. The headline.
+    /// nibdex's share of all retrieval, as a percentage. Tool calls only, so on
+    /// a box where the hook does the work this reads far lower than the truth —
+    /// see `hook_deliveries`.
     pub nibdex_share_pct: f64,
+    /// Answers attached by `nibdex hook` from THIS index.
+    ///
+    /// Reported BESIDE `nibdex_share_pct` rather than folded into it, for two
+    /// reasons. A hook delivery is not a call the model chose to make, and it
+    /// rides on a search already counted in `retrieval_elsewhere` — so adding it
+    /// to the numerator of the same fraction would double-count the one event.
+    /// And the two numbers disagreeing is the finding: `nibdex_queries: 0`
+    /// against a non-zero delivery count says the deferred tool surface is
+    /// unused while the resident path is carrying the tool.
+    ///
+    /// Zero is ambiguous on its own — an unwired hook and a hook that never
+    /// matched look identical here. `nibdex hook --stats` separates them.
+    pub hook_deliveries: i64,
 }
 
 /// One retired corpus, and why its non-zero counts are not a defect.

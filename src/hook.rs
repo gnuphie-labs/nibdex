@@ -56,10 +56,71 @@ const MIN_TERM: usize = 3;
 const SEARCH_TOOLS: [&str; 5] = ["grep", "rg", "ripgrep", "ack", "ag"];
 
 /// Flags that consume the next argument, so it is not mistaken for the pattern.
-const VALUED_FLAGS: [&str; 13] = [
-    "-e", "-f", "-m", "-A", "-B", "-C", "-t", "-g", "--include", "--exclude",
+///
+/// ⚠️ `-e` IS NOT ONE OF THESE, and it was. Treated like `-A 5` — a flag whose
+/// value must be skipped — `-e` had its value skipped too, and the value of `-e`
+/// is exactly the pattern. So the next bare token was taken instead: the PATH.
+/// Driving the release binary, `grep -e resolve_capturing_commit src` injected 25
+/// hits for `"src"`, labelled, provenance-stamped, freshness-stamped and logged
+/// `served` — a confident, well-formed answer to a question nobody asked. That is
+/// the failure this whole file exists to avoid, and it is worse than a miss
+/// because nothing prompts the caller to doubt it; it also counted as a delivery,
+/// so it inflated the one adoption number that measures this path.
+const VALUED_FLAGS: [&str; 12] = [
+    "-f", "-m", "-A", "-B", "-C", "-t", "-g", "--include", "--exclude",
     "--exclude-dir", "--max-count", "--type",
 ];
+
+/// What `args[i]` says about the pattern, when it says anything at all.
+enum PatternArg {
+    /// The pattern itself, and how many tokens carried it.
+    Pattern(String, usize),
+    /// The pattern is not in `argv`: `-f FILE` supplies patterns from a file we
+    /// are not going to read, and a pattern flag with nothing after it is
+    /// malformed. Either way the question cannot be known, so it is declined.
+    /// Guessing here is what produced the wrong-question injection above.
+    Decline,
+}
+
+/// Read the `-e` family — the flags whose VALUE IS the pattern — at `args[i]`.
+///
+/// Shared by `pattern_from` and `paths_from` so the two cannot disagree about
+/// which token was the pattern. They did disagree before: one took the path as
+/// the pattern while the other consumed the path as the pattern and reported no
+/// scope at all, so a `-e` search was both answered for the wrong term AND
+/// answered unscoped.
+fn pattern_arg_at(args: &[&String], i: usize) -> Option<PatternArg> {
+    let a = args[i].as_str();
+    let next = args.get(i + 1).map(|s| s.as_str());
+    let with_value = |v: Option<&str>, used: usize| {
+        Some(match v {
+            Some(v) => PatternArg::Pattern(v.to_string(), used),
+            None => PatternArg::Decline,
+        })
+    };
+    if a == "-f" || a == "--file" || a.starts_with("--file=") {
+        return Some(PatternArg::Decline);
+    }
+    if a == "-e" || a == "--regexp" {
+        return with_value(next, 2);
+    }
+    if let Some(v) = a.strip_prefix("--regexp=") {
+        return Some(PatternArg::Pattern(v.to_string(), 1));
+    }
+    // Attached short form. `-eneedle` is `-e needle`, and so is `-en` — grep
+    // reads everything after `-e` as the value, so this is not a guess.
+    if !a.starts_with("--")
+        && let Some(v) = a.strip_prefix("-e")
+        && !v.is_empty()
+    {
+        return Some(PatternArg::Pattern(v.to_string(), 1));
+    }
+    // A short cluster whose LAST flag is `-e`: `grep -rne needle`.
+    if a.len() > 2 && a.starts_with('-') && !a.starts_with("--") && a.ends_with('e') {
+        return with_value(next, 2);
+    }
+    None
+}
 
 /// Append one line recording what this firing did.
 ///
@@ -75,33 +136,312 @@ const VALUED_FLAGS: [&str; 13] = [
 /// caller's own query and is needed to tell a useful firing from a noisy one,
 /// but no file contents, no result bodies, and no command text. JSONL, appended,
 /// best-effort — a logging failure must never affect the caller.
+fn log_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".nibdex").join("hook-log.jsonl"))
+}
+
+/// One JSONL line. Pure, so the escaping can be tested without a filesystem.
+///
+/// Serialized, never hand-formatted. The hand-rolled writer STRIPPED `\` and `"`
+/// from the term and escaped nothing else, so a term or a path holding a control
+/// character wrote a line that is not JSON — which `parse_log` then counts as
+/// unreadable, making the WRITER's bug read as a broken log. Stripping also
+/// silently altered the caller's own query, in the one field recorded to tell a
+/// useful firing from a noisy one.
+fn log_line(
+    now: u64,
+    outcome: &str,
+    pat: &str,
+    scoped: bool,
+    hits: usize,
+    db: Option<&Path>,
+) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "ts": now,
+            "outcome": outcome,
+            "term_len": pat.chars().count(),
+            "term": pat,
+            "scoped": scoped,
+            "hits": hits,
+            "db": db.map(|d| d.display().to_string()).unwrap_or_default(),
+        })
+    )
+}
+
 fn log_firing(outcome: &str, pat: &str, scoped: bool, hits: usize, db: Option<&Path>) {
-    let Some(home) = std::env::var_os("HOME") else { return };
-    let dir = PathBuf::from(home).join(".nibdex");
+    let Some(path) = log_path() else { return };
+    let Some(dir) = path.parent().map(Path::to_path_buf) else { return };
     let _ = std::fs::create_dir_all(&dir);
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let line = format!(
-        "{{\"ts\":{},\"outcome\":\"{}\",\"term_len\":{},\"term\":\"{}\",\
-         \"scoped\":{},\"hits\":{},\"db\":\"{}\"}}\n",
-        now,
-        outcome,
-        pat.chars().count(),
-        pat.replace(['\\', '"'], ""),
-        scoped,
-        hits,
-        db.map(|d| d.display().to_string()).unwrap_or_default(),
-    );
+    let line = log_line(now, outcome, pat, scoped, hits, db);
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("hook-log.jsonl"))
-    {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// One parsed firing. Kept separate from the write side so a malformed or
+/// hand-edited line degrades to "skipped", never to a wrong total.
+struct Firing {
+    ts: u64,
+    outcome: String,
+    hits: usize,
+    scoped: bool,
+    db: String,
+}
+
+/// Parse the log, discarding anything unreadable. Returns the survivors and the
+/// number of lines that could not be read — reporting the discard count matters
+/// because a silently-dropped line is the difference between "the hook is quiet"
+/// and "the log is broken", and those must not look alike.
+fn parse_log(text: &str) -> (Vec<Firing>, usize) {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            skipped += 1;
+            continue;
+        };
+        let (Some(ts), Some(outcome)) = (
+            v.get("ts").and_then(Value::as_u64),
+            v.get("outcome").and_then(Value::as_str),
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        out.push(Firing {
+            ts,
+            outcome: outcome.to_string(),
+            hits: v.get("hits").and_then(Value::as_u64).unwrap_or(0) as usize,
+            scoped: v.get("scoped").and_then(Value::as_bool).unwrap_or(false),
+            db: v.get("db").and_then(Value::as_str).unwrap_or_default().to_string(),
+        });
+    }
+    (out, skipped)
+}
+
+/// Do two path strings name the same file? Canonicalises where it can, because
+/// the log records whatever path the hook resolved while `check()` reports
+/// whatever path the pool was opened with, and those can differ by a symlink or
+/// a relative prefix while naming one database. Falls back to string equality
+/// when a path cannot be resolved — a deleted or moved db must not make the
+/// comparison panic or silently match everything.
+/// `canonical` is the caller's db, ALREADY resolved — resolving it here meant
+/// doing it once per log line.
+fn same_db(a: &str, canonical: &Path) -> bool {
+    if a.is_empty() {
+        return false;
+    }
+    // The overwhelmingly common case is the same db writing and reading the same
+    // string, which needs no syscall at all.
+    if Path::new(a) == canonical {
+        return true;
+    }
+    match std::fs::canonicalize(a) {
+        Ok(x) => x == canonical,
+        // Unresolvable and not string-equal: a different database, or one that is
+        // gone. Failing open here would inflate every workspace's count.
+        Err(_) => false,
+    }
+}
+
+/// How many answers THIS index has delivered through the hook.
+///
+/// WHY IT IS SCOPED TO ONE DB, and this is the load-bearing part: the log is
+/// machine-global — every workspace's firings append to the same file — while
+/// `check().adoption` is deliberately workspace-scoped, because rc.2 had to fix
+/// it counting every session on the machine. Folding an unscoped count into a
+/// scoped instrument would re-introduce exactly that bug in a new place, so a
+/// firing counts only when it names this database.
+///
+/// Only a SERVED firing counts, either intent. A `no_hits` firing means the hook
+/// ran and had nothing, which is not a delivery; `--stats` is where that split
+/// belongs.
+///
+/// ⚠️ The whole log is read into memory on every call, and `check()` calls this.
+/// That is fine at today's sizes and is NOT fine forever — the log is
+/// machine-global, append-only and nothing rotates it. Naming it here because the
+/// fix is a rotation policy, which is a decision about how much history the
+/// measurement is allowed to lose, and that is not a decision this function can
+/// make on its own.
+pub(crate) fn deliveries_for(db: &Path) -> i64 {
+    let Some(path) = log_path() else { return 0 };
+    let Ok(text) = std::fs::read_to_string(path) else { return 0 };
+    let (firings, _) = parse_log(&text);
+    // Canonicalise the CALLER's db ONCE. `same_db` used to resolve both sides
+    // inside the filter, so this cost two syscalls per log line, on a file that
+    // only ever grows, every time `check()` ran.
+    let canonical = std::fs::canonicalize(db).unwrap_or_else(|_| db.to_path_buf());
+    firings
+        .iter()
+        .filter(|f| is_delivery(&f.outcome) && same_db(&f.db, &canonical))
+        .count() as i64
+}
+
+/// An answer actually handed to the caller, either intent.
+///
+/// `schema_served` belongs here: the index answered and the answer reached the
+/// caller, which is what a delivery is. Leaving it out meant a workspace whose
+/// searches all miss but whose SQL calls all hit would report
+/// `hook_deliveries: 0` — "nibdex is not being used" when the truth is the
+/// opposite, on the one instrument built to measure this path.
+fn is_delivery(outcome: &str) -> bool {
+    outcome == "served" || outcome == "schema_served"
+}
+
+/// The outcomes this build knows, by intent. `render_stats` shows everything else
+/// as `other` rather than counting it into a total it never displays.
+const SEARCH_OUTCOMES: [&str; 4] = ["served", "no_hits", "no_index", "query_error"];
+const SCHEMA_OUTCOMES: [&str; 3] = ["schema_served", "schema_no_hits", "schema_no_index"];
+
+/// Median of an already-collected sample. Returns `None` for an empty sample
+/// rather than 0, because "no served firings" and "served firings returning
+/// nothing" are different facts and a zero would conflate them.
+fn median(mut v: Vec<usize>) -> Option<usize> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    Some(v[v.len() / 2])
+}
+
+fn days_ago(ts: u64, now: u64) -> String {
+    let secs = now.saturating_sub(ts);
+    match secs {
+        s if s < 3_600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3_600),
+        s => format!("{} d ago", s / 86_400),
+    }
+}
+
+/// Render the report. Pure, so the shape can be tested without a filesystem.
+fn render_stats(f: &[Firing], skipped: usize, now: u64, path: &Path) -> String {
+    let mut s = String::new();
+    let total = f.len();
+    if total == 0 {
+        s.push_str(&format!(
+            "nibdex hook — no firings recorded.\n\n  log  {}\n\n\
+             The hook has either never been wired, or has never seen a search it\n\
+             could answer. Those are different problems and this log cannot tell\n\
+             them apart: check that `nibdex hook` is in your PreToolUse settings,\n\
+             then run a `grep` inside an indexed tree and look again.\n",
+            path.display()
+        ));
+        return s;
+    }
+
+    let count = |o: &str| f.iter().filter(|x| x.outcome == o).count();
+    let (served, no_hits, no_index) = (count("served"), count("no_hits"), count("no_index"));
+    let query_error = count("query_error");
+    let (sc_served, sc_no_hits, sc_no_index) =
+        (count("schema_served"), count("schema_no_hits"), count("schema_no_index"));
+    let searches: usize = SEARCH_OUTCOMES.iter().map(|o| count(o)).sum();
+    let schemas: usize = SCHEMA_OUTCOMES.iter().map(|o| count(o)).sum();
+    // Anything this build does not recognise. The report used to bucket three
+    // outcomes while totalling all of them, so the schema intent's three arrived
+    // counted-but-unshown and the percentages silently summed to less than 100
+    // with no line to explain the gap. Naming the remainder means the next
+    // outcome added cannot go quietly missing the same way.
+    let other = total.saturating_sub(searches + schemas);
+    let pct = |n: usize| (n as f64) * 100.0 / (total as f64);
+    let first = f.iter().map(|x| x.ts).min().unwrap_or(now);
+    let last = f.iter().map(|x| x.ts).max().unwrap_or(now);
+
+    s.push_str(&format!(
+        "nibdex hook — {total} firing{}, {} → {}\n\n",
+        if total == 1 { "" } else { "s" },
+        days_ago(first, now),
+        days_ago(last, now),
+    ));
+    s.push_str(&format!("  served    {served:5}  {:5.1}%", pct(served)));
+    match median(f.iter().filter(|x| x.outcome == "served").map(|x| x.hits).collect()) {
+        Some(m) => s.push_str(&format!("   median {m} hits\n")),
+        None => s.push('\n'),
+    }
+    s.push_str(&format!("  no_hits   {no_hits:5}  {:5.1}%\n", pct(no_hits)));
+    s.push_str(&format!("  no_index  {no_index:5}  {:5.1}%", pct(no_index)));
+    if no_index > 0 {
+        s.push_str("   ← searches in a tree no index covers\n");
+    } else {
+        s.push('\n');
+    }
+    if query_error > 0 {
+        s.push_str(&format!(
+            "  refused   {query_error:5}  {:5.1}%   ← the index could not run the query\n",
+            pct(query_error)
+        ));
+    }
+    // The schema intent gets its own block rather than a share of the lines
+    // above: it answers a different question ("what shape is this table"), and
+    // folding its counts into the search lines would make a healthy SQL workspace
+    // read as a mediocre search one. Shown only when it has fired, so the common
+    // report stays short.
+    if schemas > 0 {
+        s.push_str(&format!("\n  schema    {schemas:5}\n"));
+        s.push_str(&format!("    served  {sc_served:5}  {:5.1}%", pct(sc_served)));
+        match median(f.iter().filter(|x| x.outcome == "schema_served").map(|x| x.hits).collect()) {
+            Some(m) => s.push_str(&format!("   median {m} object(s)\n")),
+            None => s.push('\n'),
+        }
+        s.push_str(&format!("    no_hits {sc_no_hits:5}  {:5.1}%", pct(sc_no_hits)));
+        if sc_no_hits > 0 {
+            s.push_str("   ← SQL naming tables no dump covers\n");
+        } else {
+            s.push('\n');
+        }
+        s.push_str(&format!("    no_index{sc_no_index:5}  {:5.1}%\n", pct(sc_no_index)));
+    }
+    if other > 0 {
+        s.push_str(&format!(
+            "\n  other     {other:5}  {:5.1}%   ← outcomes this build does not know\n",
+            pct(other)
+        ));
+    }
+    s.push_str(&format!(
+        "\n  scoped     {} of {searches} search(es)\n  log        {}\n",
+        f.iter().filter(|x| x.scoped).count(),
+        path.display()
+    ));
+    if skipped > 0 {
+        s.push_str(&format!("  unreadable {skipped} line(s) skipped\n"));
+    }
+    // Say what the number does NOT mean. The savings ledger carries the same
+    // honest limit: an answer offered is not an answer used, and a report that
+    // let "served" read as "helped" would be the flattering instrument this
+    // whole lane exists to replace.
+    s.push_str(
+        "\n  `served` means the answer was attached, not that it was used —\n  \
+         whether the model acted on it is not observable from here.\n",
+    );
+    s
+}
+
+/// `nibdex hook --stats` — read the firing log and report what the hook has done.
+///
+/// WHY THIS EXISTS. A hook injection is not a tool call, so every other
+/// instrument here is blind to it: `check().adoption` counts tool calls, and the
+/// savings ledger only fires when an MCP tool is called. The log was added so the
+/// augment path was not invisible — but nothing read it, and a measurement no
+/// one can see is the same as no measurement.
+pub fn stats() -> ! {
+    let Some(path) = log_path() else {
+        println!("No $HOME is set, so there is no hook log to read.");
+        std::process::exit(0);
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (firings, skipped) = parse_log(&text);
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    print!("{}", render_stats(&firings, skipped, now, &path));
+    std::process::exit(0);
 }
 
 /// Emit nothing: the tool runs exactly as it would have. Rule 1 and rule 2 both
@@ -196,6 +536,14 @@ pub(crate) fn pattern_from(command: &str) -> Option<String> {
         let mut i = 0;
         while i < args.len() {
             let a = args[i].as_str();
+            // The `-e` family FIRST: its value is the pattern, so it has to be
+            // read before the skip rules below can swallow it.
+            if let Some(p) = pattern_arg_at(&args, i) {
+                return match p {
+                    PatternArg::Pattern(v, _) => Some(v),
+                    PatternArg::Decline => None,
+                };
+            }
             if VALUED_FLAGS.contains(&a) {
                 i += 2;
                 continue;
@@ -235,6 +583,21 @@ pub(crate) fn paths_from(command: &str) -> Vec<String> {
         let mut out = Vec::new();
         while i < args.len() {
             let a = args[i].as_str();
+            // The `-e` family carries the pattern, so every bare argument after it
+            // is a PATH. Without this the first path was consumed as the pattern
+            // and the search then ran with no scope at all.
+            if let Some(p) = pattern_arg_at(&args, i) {
+                match p {
+                    PatternArg::Pattern(_, used) => {
+                        seen_pattern = true;
+                        i += used;
+                    }
+                    // `pattern_from` declines the whole search here, and a scope
+                    // for a question we are not answering means nothing.
+                    PatternArg::Decline => return Vec::new(),
+                }
+                continue;
+            }
             if VALUED_FLAGS.contains(&a) {
                 i += 2;
                 continue;
@@ -317,11 +680,26 @@ async fn db_indexes(pool: &sqlx::SqlitePool, cwd: &Path) -> bool {
     // beside a working index, where it qualified on relevance, was checked
     // first, and then failed the query, silencing the hook. Relevant is not the
     // same as usable.
-    relevant
-        && sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM source_chunks")
-            .fetch_one(pool)
-            .await
-            .is_ok_and(|n| n > 0)
+    if !relevant {
+        return false;
+    }
+    if sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM source_chunks")
+        .fetch_one(pool)
+        .await
+        .is_ok_and(|n| n > 0)
+    {
+        return true;
+    }
+    // EITHER corpus counts, because the hook has TWO intents. A workspace holding
+    // a schema dump and no indexed source is precisely the case the second intent
+    // was built for, and demanding `source_chunks` made that workspace
+    // undiscoverable — the schema answer worked there only when a
+    // `NIBDEX_HOOK_DB` override skipped this check entirely, which is why the
+    // documented example needs one and a real DBA tree would not have known to.
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_objects")
+        .fetch_one(pool)
+        .await
+        .is_ok_and(|n| n > 0)
 }
 
 /// Which indexed repo the caller is standing in — the LONGEST `indexed_repos`
@@ -422,6 +800,28 @@ pub(crate) fn freshness_label(age_secs: u64) -> String {
     }
 }
 
+/// Truncate to at most `max` BYTES, never mid-character.
+///
+/// `&s[..110]` PANICS when byte 110 lands inside a multi-byte character, and this
+/// corpus is full of them — every ⚠️, → and — in a comment is multi-byte, and the
+/// hook's own source is written that way. The consequence is worse than a crash
+/// report: under the README's documented `2>/dev/null || true` wiring the panic is
+/// swallowed, so the answer is simply lost, and because the `served` log line is
+/// written AFTER the render, the loss is invisible to `--stats` as well.
+///
+/// This project's P1 audit concluded every byte-slice site was "char-boundary /
+/// bounds / length-guarded". This one was not.
+fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Group hits by directory and render the caller-facing text.
 ///
 /// Grouping is the whole value: measured on an 18-repo corpus, grep returns
@@ -469,14 +869,14 @@ pub(crate) fn render(pat: &str, hits: &[Hit], fresh: &str, db: &str) -> Option<S
         let commit = h
             .3
             .as_deref()
-            .map(|c| format!("  (via {})", &c[..c.len().min(7)]))
+            .map(|c| format!("  (via {})", truncate_bytes(c, 7)))
             .unwrap_or_default();
         let body = h.2.trim();
         out.push(format!(
             "    {}:{}: {}{}",
             h.0,
             h.1,
-            &body[..body.len().min(110)],
+            truncate_bytes(body, 110),
             commit
         ));
     }
@@ -489,6 +889,243 @@ pub(crate) fn render(pat: &str, hits: &[Hit], fresh: &str, db: &str) -> Option<S
             .to_string(),
     );
     Some(out.join("\n"))
+}
+
+/// SQL statements worth reading table names out of. A `SELECT` or an `UPDATE`
+/// names tables whose shape the caller has to know; `CREATE`/`ALTER` are the
+/// caller telling US the shape, and answering those from a dump that predates
+/// their change would be confidently stale.
+const SQL_LEAD: [&str; 4] = ["select", "update", "delete", "insert"];
+
+/// A SQL keyword alone is NOT enough to call something a query, and finding that
+/// out cost a test: `git commit -m 'select the best option from the list'`
+/// matched `from` and extracted the table `the`. Ordinary English contains SQL
+/// keywords, and taxing every commit message would be a perverse outcome for a
+/// hook whose first rule is to stay free on the common path.
+///
+/// So a client must be named too. Matched as a substring rather than a leading
+/// token, because the real invocation is routinely wrapped —
+/// `ssh host "psql -c '…'"` — and the wrapper is not the point.
+const SQL_TOOLS: [&str; 7] =
+    ["psql", "sqlcmd", "mysql", "mariadb", "sqlite3", "duckdb", "clickhouse-client"];
+
+/// Table names mentioned in a shell command that contains SQL.
+///
+/// WHY THIS IS A SECOND INTENT AND NOT AN EXTENSION OF THE FIRST. The hook's
+/// search classifier asks "where is this string"; this asks "what shape is this
+/// table". Measured across 107 sessions in one large workspace, SQL-bearing
+/// shell calls were 73% as numerous as search-bearing ones — a stream nearly as
+/// large as the one the hook already serves, and served by nothing. Within it,
+/// 253 calls did nothing but re-derive a schema and 27 failed on a guessed
+/// column name.
+///
+/// DELIBERATELY CRUDE. This is not a SQL parser and must never become one: it
+/// runs on every Bash call and the budget is microseconds. It takes the token
+/// after FROM, JOIN, INTO or UPDATE and lets the lookup decide — an unknown
+/// name simply misses, which costs one indexed probe that returns nothing. The
+/// failure mode of over-matching is a miss; the failure mode of parsing is
+/// spending real time on `cargo test`.
+fn tables_from_sql(command: &str) -> Vec<String> {
+    let lower = command.to_lowercase();
+    if !SQL_TOOLS.iter().any(|t| lower.contains(t)) || !SQL_LEAD.iter().any(|k| lower.contains(k)) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let toks: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == ',' || c == ';')
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, t) in toks.iter().enumerate() {
+        // The keyword can arrive wearing the shell's quote: `-c 'update x …`
+        // tokenizes as `'update`, which matched nothing and silently dropped
+        // every single-quoted UPDATE. Caught by a test, not in the field.
+        let kw = t.trim_matches(|c: char| c == '"' || c == '\'').to_lowercase();
+        if !matches!(kw.as_str(), "from" | "join" | "into" | "update") {
+            continue;
+        }
+        let Some(next) = toks.get(i + 1) else { continue };
+        // Two passes, and the order matters. The first drops shell punctuation
+        // while KEEPING the quoting that is part of a SQL identifier, so
+        // `"public"."bids"` survives intact. The second then strips the outer
+        // quote a shell argument leaves behind (`from orders"` → `orders`) —
+        // without it the trailing quote reaches the log and the dedupe, where
+        // `orders` and `orders"` read as two different tables.
+        let name = next
+            .trim_matches(|c: char| {
+                !(c.is_alphanumeric() || c == '_' || c == '.' || c == '[' || c == ']' || c == '"')
+            })
+            .trim_matches(|c: char| c == '"' || c == '\'');
+        // A subquery (`FROM (SELECT`), a placeholder, or a bare number is not a
+        // table. So is `information_schema.columns` — answering an introspection
+        // query with our own cached introspection would be circular and, worse,
+        // would shadow the live answer the caller deliberately went for.
+        let low = name.to_lowercase();
+        if name.is_empty()
+            || low.starts_with("select")
+            || low.starts_with("information_schema")
+            || low.starts_with("sys.")
+            || low.starts_with("pragma")
+            || name.chars().next().is_some_and(|c| c.is_numeric())
+        {
+            continue;
+        }
+        let name = name.to_string();
+        if !out.iter().any(|e| e.eq_ignore_ascii_case(&name)) {
+            out.push(name);
+        }
+        // Two is enough to answer a join without turning an injection into a
+        // wall of text. A caller who needs a third can ask.
+        if out.len() == 2 {
+            break;
+        }
+    }
+    out
+}
+
+/// Render the schema answer.
+///
+/// Labelled and dated for the same reason every other injection is: unlabelled
+/// text is indistinguishable from the tool's own output. Dated more emphatically
+/// here, because a schema dump is a SNAPSHOT the user took by hand — it can be
+/// arbitrarily old, and unlike the code index nothing re-derives it on a commit.
+/// A stale schema presented as current is precisely the confidently-wrong answer
+/// this corpus exists to prevent.
+pub(crate) fn render_schema(hits: &[crate::schema_index::SchemaHit], age: &str) -> Option<String> {
+    if hits.is_empty() {
+        return None;
+    }
+    let mut out = vec![format!(
+        "[nibdex] schema for {} — from an indexed dump, {}.",
+        hits.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", "),
+        age
+    )];
+    // A wide table is the normal case, not a pathological one — the first live
+    // firing returned 60 columns — and the whole column list IS the answer, so
+    // truncating hard would defeat the purpose. The cap exists for the genuinely
+    // pathological table, and it announces what it dropped: a silent cut would
+    // let a caller conclude a column does not exist.
+    const MAX_LINES: usize = 80;
+    for h in hits.iter().take(2) {
+        let lines: Vec<&str> = h.body.lines().collect();
+        for line in lines.iter().take(MAX_LINES) {
+            out.push(format!("  {line}"));
+        }
+        if lines.len() > MAX_LINES {
+            out.push(format!(
+                "    …{} more line(s) — ask the database, not this summary",
+                lines.len() - MAX_LINES
+            ));
+        }
+    }
+    out.push(
+        "  (a dump is a snapshot, not a live read — if this disagrees with the \
+         database, the database is right)"
+            .to_string(),
+    );
+    Some(out.join("\n"))
+}
+
+/// How old the newest schema dump in this index is, in words.
+///
+/// ⚠️ MEASURED FROM THE DUMP FILE'S MTIME, NOT FROM `indexed_at`, and the
+/// difference is the whole point of the number. `indexed_at` is refreshed by
+/// `upsert_document` on EVERY indexing pass — the schema step re-upserts
+/// unconditionally, since the content-hash skip lives in `source_index` — so it
+/// records when nibdex last ran, not when the human last took the dump. A dump
+/// generated a month ago and re-indexed this morning reported "indexed today".
+///
+/// That matters more here than anywhere else in this file. A schema dump is a
+/// hand-taken snapshot that NOTHING re-derives on a commit, so its age is the
+/// only thing standing between the caller and a confidently-stale answer — and
+/// this project's stated mitigation for the un-watched-dump gap is precisely
+/// that "every answer states its age". It stated an age that measured the wrong
+/// event.
+///
+/// The dump's own `generated_at` is more authoritative still — it is the
+/// database's clock at dump time, it is already parsed, and `persist_dump` then
+/// discards it. Storing it needs a migration, so it is the next step, not this
+/// one. mtime is honest in every case except a dump COPIED into place, where it
+/// reports the copy.
+async fn schema_age(pool: &sqlx::SqlitePool) -> String {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT MAX(mtime) FROM documents WHERE kind = 'schema'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let Some((Some(ts),)) = row else { return "age unknown".to_string() };
+    // `upsert_document` stores 0 when the filesystem could not say. Reporting
+    // that as a date in 1970 would be worse than admitting we do not know.
+    if ts <= 0 {
+        return "age unknown".to_string();
+    }
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match now.saturating_sub(ts) {
+        s if s < 86_400 => "taken today".to_string(),
+        s if s < 172_800 => "taken yesterday".to_string(),
+        s => format!("taken {} days ago", s / 86_400),
+    }
+}
+
+/// Emit the injection and exit. The one place that writes to stdout.
+fn emit(text: &str) -> ! {
+    println!(
+        "{}",
+        json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "additionalContext": text}})
+    );
+    std::process::exit(0);
+}
+
+/// The SQL intent: answer "what shape is this table" from the indexed dump.
+///
+/// Reached only when the command is NOT a usable search, so it can never
+/// displace the search answer — the two intents do not compete for one call.
+/// Every path exits 0 (rule 1).
+async fn answer_schema_or_exit(command: &str, cwd: &Path) -> ! {
+    let tables = tables_from_sql(command);
+    if tables.is_empty() {
+        // The fast reject, and it is the common case: most Bash calls are
+        // neither a search nor SQL. Not logged, for the same reason the search
+        // reject is not — it fires on nearly every call and would swamp the log.
+        allow_silently();
+    }
+    let term = tables.join(",");
+    let Some((db, pool)) = find_db(cwd).await else {
+        log_firing("schema_no_index", &term, false, 0, None);
+        allow_silently();
+    };
+    let mut hits = Vec::new();
+    for t in &tables {
+        match crate::schema_index::lookup_object(&pool, t).await {
+            Ok(mut h) => hits.append(&mut h),
+            // Fail open per table, not per call: one unreadable lookup must not
+            // cost the caller the other table's answer.
+            Err(_) => continue,
+        }
+    }
+    let age = schema_age(&pool).await;
+    pool.close().await;
+
+    match render_schema(&hits, &age) {
+        Some(text) => {
+            log_firing("schema_served", &term, false, hits.len(), Some(&db));
+            emit(&text);
+        }
+        None => {
+            // SQL against tables this index has never heard of. Distinguishing
+            // it from "no index at all" is the same distinction `corpus_empty`
+            // makes on the query side, and it is the number that will say
+            // whether the dump covers the databases actually in use.
+            log_firing("schema_no_hits", &term, false, 0, Some(&db));
+            allow_silently();
+        }
+    }
 }
 
 /// Read the `PreToolUse` event, decide, and emit. Never returns an error to the
@@ -510,6 +1147,11 @@ pub async fn run() -> ! {
         allow_silently();
     }
     let input = ev.get("tool_input").cloned().unwrap_or(Value::Null);
+    let cwd = ev
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
 
     // Rule 2: reject the common case before touching the filesystem.
     let pat = if tool == "Grep" {
@@ -519,10 +1161,21 @@ pub async fn run() -> ! {
             .map(str::to_string)
     } else {
         let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
-        if !SEARCH_TOOLS.iter().any(|t| cmd.contains(t)) {
-            allow_silently();
+        let p = if SEARCH_TOOLS.iter().any(|t| cmd.contains(t)) {
+            pattern_from(cmd)
+        } else {
+            None
+        };
+        // SECOND INTENT. Falling through on "not a usable search" rather than
+        // on "contains no search tool" matters: `psql -c "select …" | grep x`
+        // holds both, and `pattern_from` correctly declines it because grep is
+        // trimming output rather than asking the index anything. Exiting there
+        // would drop a SQL call that the schema corpus can answer. Never
+        // returns.
+        match p.as_deref().filter(|s| term_is_indexable(s)) {
+            Some(_) => p,
+            None => answer_schema_or_exit(cmd, &cwd).await,
         }
-        pattern_from(cmd)
     };
     let scope = if tool == "Grep" {
         input.get("path").and_then(Value::as_str).map(|p| vec![p.to_string()]).unwrap_or_default()
@@ -537,11 +1190,6 @@ pub async fn run() -> ! {
         allow_silently();
     };
 
-    let cwd = ev
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     let Some((db, pool)) = find_db(&cwd).await else {
         // A real miss worth counting: the caller asked something answerable and
         // no index covered their tree.
@@ -566,7 +1214,15 @@ pub async fn run() -> ! {
     let hits = crate::source_index::find_code_in_repo(&pool, &pat, fetch, repo.as_deref()).await;
     let fresh = freshness(&pool).await;
     pool.close().await;
-    let Ok(hits) = hits else { allow_silently() };
+    let Ok(hits) = hits else {
+        // The ONE terminal state that logged nothing, and that is how a whole
+        // class of failure stayed invisible: the index refused the query, the
+        // fail-open swallowed the error, and every instrument here counts firings
+        // from this log — so the failure could not be seen, counted, or believed.
+        // Still fails open. Now it is counted.
+        log_firing("query_error", &pat, !scope.is_empty(), 0, Some(&db));
+        allow_silently()
+    };
 
     // `find_code` reports the snippet's start line, which does not always hold
     // the term — a hit can surface as a bare `}`. Junk in an injected answer
@@ -670,6 +1326,44 @@ mod tests {
         assert!(paths_from("cargo test 2>&1 | grep '^test result'").is_empty());
     }
 
+    /// `-e` carries the pattern; it is not a flag whose value gets skipped.
+    ///
+    /// The mutation that proves this test: put `-e` back in `VALUED_FLAGS` and
+    /// every assertion below returns the PATH — which is what shipped, and what
+    /// made the hook inject 25 confident hits for `"src"` against a search for
+    /// something else entirely.
+    #[test]
+    fn the_e_family_carries_the_pattern_not_the_path() {
+        for cmd in [
+            "grep -e needle src/",
+            "rg --regexp needle src/",
+            "grep --regexp=needle src/",
+            "grep -eneedle src/",
+            "grep -rne needle src/",
+        ] {
+            assert_eq!(pattern_from(cmd).as_deref(), Some("needle"), "pattern of: {cmd}");
+        }
+        // ...and the path is then a SCOPE. Before, it was consumed as the pattern,
+        // so the search was answered for the wrong term AND left unscoped.
+        assert_eq!(paths_from("grep -e needle src/"), vec!["src"]);
+        assert_eq!(paths_from("grep -rne needle src/ tests/"), vec!["src", "tests"]);
+        // The ordinary forms must not regress.
+        assert_eq!(pattern_from("grep -rn needle src/").as_deref(), Some("needle"));
+        assert_eq!(pattern_from("grep -A 5 needle f.rs").as_deref(), Some("needle"));
+    }
+
+    /// When the pattern is NOT in the command, decline. `-f` reads patterns from a
+    /// file we are not going to open, and a bare `-e` is malformed — guessing at
+    /// either produces an answer to a question the caller never asked, which is
+    /// strictly worse than staying silent.
+    #[test]
+    fn a_pattern_we_cannot_know_is_declined_not_guessed() {
+        assert_eq!(pattern_from("grep -f patterns.txt src/"), None);
+        assert_eq!(pattern_from("grep --file=patterns.txt src/"), None);
+        assert_eq!(pattern_from("grep -e"), None);
+        assert!(paths_from("grep -f patterns.txt src/").is_empty());
+    }
+
     #[test]
     fn regex_and_tiny_terms_are_declined() {
         assert!(term_is_indexable("session_edges"));
@@ -704,5 +1398,341 @@ mod tests {
         );
         // empty in, nothing out — never inject an empty banner
         assert!(render("needle", &[], "index current", "/x/nibdex.db").is_none());
+    }
+
+    /// A long line holding a multi-byte character must RENDER, not panic.
+    ///
+    /// The mutation that proves it: restore `truncate_bytes(body, 110)` and
+    /// this panics on a byte index inside the arrow. In the field that panic is
+    /// swallowed by the documented `2>/dev/null || true` wiring, so the answer is
+    /// lost silently — and since the `served` line is logged after the render, the
+    /// loss never reaches `--stats` either.
+    #[test]
+    fn a_long_non_ascii_line_renders_instead_of_panicking() {
+        // 108 ASCII bytes, then a 3-byte arrow occupying 108..111 — so the old
+        // cut at byte 110 lands inside it.
+        let body = format!("{}→ and more text past the boundary", "x".repeat(108));
+        assert!(!body.is_char_boundary(110), "fixture must straddle the cut");
+        let hits = vec![("a/x.rs".to_string(), 4, body, None)];
+        let out = render("needle", &hits, "index current", "/x/nibdex.db").expect("must render");
+        assert!(out.contains("a/x.rs:4"), "{out}");
+        // A short line is untouched, and a non-ASCII sha prefix cannot panic either.
+        assert_eq!(truncate_bytes("short", 110), "short");
+        assert_eq!(truncate_bytes("→→→", 4), "→");
+    }
+
+    fn firing(ts: u64, outcome: &str, hits: usize, scoped: bool) -> Firing {
+        Firing { ts, outcome: outcome.to_string(), hits, scoped, db: "/x/nibdex.db".into() }
+    }
+
+    /// The scoping that keeps a machine-global log out of a workspace-scoped
+    /// instrument. Without it, `check().adoption` on one workspace would count
+    /// deliveries made to another — the bug rc.2 fixed, reappearing by a new
+    /// route.
+    #[test]
+    fn same_db_rejects_a_different_database_and_an_empty_field() {
+        let dir = std::env::temp_dir();
+        let mine = dir.join("nibdex-samedb-mine.db");
+        let theirs = dir.join("nibdex-samedb-theirs.db");
+        std::fs::write(&mine, b"x").unwrap();
+        std::fs::write(&theirs, b"x").unwrap();
+
+        assert!(same_db(&mine.display().to_string(), &mine));
+        assert!(!same_db(&theirs.display().to_string(), &mine), "another workspace must not count");
+        // A `no_index` firing records an empty db; it belongs to no index and
+        // must never be attributed to the one asking.
+        assert!(!same_db("", &mine));
+        // Unresolvable paths fall back to string equality rather than matching
+        // everything — failing open here would inflate every workspace's count.
+        assert!(!same_db("/nope/a.db", Path::new("/nope/b.db")));
+        assert!(same_db("/nope/a.db", Path::new("/nope/a.db")));
+
+        let _ = std::fs::remove_file(mine);
+        let _ = std::fs::remove_file(theirs);
+    }
+
+    /// A malformed line must be COUNTED as unreadable, never silently dropped and
+    /// never parsed into a firing. A log that quietly loses lines reports a
+    /// smaller, healthier-looking number than the truth — the flattering-
+    /// instrument failure this whole lane exists to correct.
+    #[test]
+    fn parse_log_skips_malformed_lines_without_absorbing_them() {
+        let text = concat!(
+            r#"{"ts":100,"outcome":"served","hits":9,"scoped":true}"#,
+            "\n",
+            "not json at all\n",
+            "\n",
+            r#"{"outcome":"served","hits":3}"#, // no ts
+            "\n",
+            r#"{"ts":200,"outcome":"no_index","hits":0,"scoped":false}"#,
+            "\n",
+        );
+        let (f, skipped) = parse_log(text);
+        assert_eq!(f.len(), 2, "only the two well-formed lines are firings");
+        assert_eq!(skipped, 2, "the junk line and the ts-less line are both counted");
+        assert_eq!(f[0].hits, 9);
+        assert_eq!(f[1].outcome, "no_index");
+    }
+
+    /// The empty case is the one that matters most in the field: an unwired hook
+    /// and a hook that never found anything to answer look IDENTICAL from here,
+    /// so the report must name both rather than implying the tool is idle.
+    #[test]
+    fn stats_on_an_empty_log_names_both_causes() {
+        let out = render_stats(&[], 0, 1_000, Path::new("/h/.nibdex/hook-log.jsonl"));
+        assert!(out.contains("no firings recorded"), "{out}");
+        assert!(out.contains("never been wired"), "must offer the wiring cause: {out}");
+        assert!(out.contains("never seen a search"), "must offer the quiet cause: {out}");
+        assert!(out.contains("/h/.nibdex/hook-log.jsonl"), "must say where it looked: {out}");
+    }
+
+    /// The split and the median are the whole report. The median is taken over
+    /// SERVED firings only — including the zero-hit rows would drag it toward 0
+    /// and make a healthy hook look useless.
+    #[test]
+    fn stats_counts_outcomes_and_medians_only_the_served() {
+        let f = vec![
+            firing(10, "served", 4, true),
+            firing(20, "served", 20, false),
+            firing(30, "served", 12, false),
+            firing(40, "no_hits", 0, true),
+            firing(50, "no_index", 0, false),
+        ];
+        let out = render_stats(&f, 0, 60, Path::new("/x/log.jsonl"));
+        assert!(out.contains("5 firings"), "{out}");
+        assert!(out.contains("median 12 hits"), "median of 4/12/20, not of all five: {out}");
+        assert!(out.contains("60.0%"), "3 of 5 served: {out}");
+        assert!(out.contains("scoped     2 of 5"), "{out}");
+        assert!(
+            out.contains("← searches in a tree no index covers"),
+            "a no_index firing must be called out, not left as a bare number: {out}"
+        );
+        // The honest limit travels with the number or the number overstates.
+        assert!(
+            out.contains("not that it was used"),
+            "must not let `served` read as `helped`: {out}"
+        );
+    }
+
+    /// The schema intent has to APPEAR. Every firing counts toward the total, so
+    /// bucketing only the three search outcomes made the percentages sum to less
+    /// than 100 with no line saying why — and a workspace whose SQL calls all hit
+    /// read as one where the hook does nothing.
+    #[test]
+    fn stats_reports_the_schema_intent_and_names_what_it_cannot_bucket() {
+        let f = vec![
+            firing(10, "served", 4, true),
+            firing(20, "schema_served", 2, false),
+            firing(30, "schema_served", 6, false),
+            firing(40, "schema_no_hits", 0, false),
+            firing(50, "query_error", 0, false),
+            firing(60, "an_outcome_from_the_future", 0, false),
+        ];
+        let out = render_stats(&f, 0, 70, Path::new("/x/log.jsonl"));
+        assert!(out.contains("median 6 object(s)"), "schema served needs its own median: {out}");
+        assert!(
+            out.contains("← SQL naming tables no dump covers"),
+            "a schema miss is the number that says whether the dump covers the databases in use: {out}"
+        );
+        assert!(
+            out.contains("← the index could not run the query"),
+            "a refused query must be visible, not merely absent: {out}"
+        );
+        assert!(
+            out.contains("outcomes this build does not know"),
+            "an unrecognised outcome must be NAMED, not quietly dropped from the buckets: {out}"
+        );
+        // The scoped denominator is searches, not every firing — schema firings
+        // are never scoped, so counting them would understate it forever.
+        assert!(out.contains("scoped     1 of 2 search(es)"), "{out}");
+    }
+
+    /// A workspace with a schema dump and NO indexed source must still be
+    /// discoverable — that is the DBA case the second intent exists for, and the
+    /// guard demanded `source_chunks`, so the schema answer only ever worked
+    /// behind a `NIBDEX_HOOK_DB` override.
+    #[tokio::test]
+    async fn a_schema_only_index_can_still_answer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let pool = crate::db::open(&tmp.path().join("nibdex.db")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO indexed_repos (repo_path, last_indexed_oid, last_indexed_at) \
+             VALUES (?, '', 0)",
+        )
+        .bind(cwd.display().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Relevant, but every corpus empty: not usable, and that must stay true.
+        assert!(!db_indexes(&pool, &cwd).await, "an empty index must not shadow a real one");
+
+        let doc: (i64,) = sqlx::query_as(
+            "INSERT INTO documents (path, kind, content_hash, mtime, indexed_at) \
+             VALUES ('/w/db.nibdex-schema.json', 'schema', 'h', 1, 1) RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO schema_objects \
+             (document_id, database_name, schema_name, object_name, object_type, \
+              columns_json, body) \
+             VALUES (?, 'shopdb', 'public', 'orders', 'table', '[]', 'shopdb.public.orders')",
+        )
+        .bind(doc.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            db_indexes(&pool, &cwd).await,
+            "a dump with no indexed source is the whole point of the schema intent"
+        );
+    }
+
+    /// A schema answer IS a delivery. Counting only `served` meant a workspace
+    /// answering on every `psql` call still reported `hook_deliveries: 0`, which
+    /// reads as "nibdex is not being used" when the opposite is true.
+    #[test]
+    fn a_schema_answer_counts_as_a_delivery() {
+        assert!(is_delivery("served"));
+        assert!(is_delivery("schema_served"));
+        assert!(!is_delivery("no_hits"));
+        assert!(!is_delivery("schema_no_hits"));
+        assert!(!is_delivery("query_error"));
+    }
+
+    /// A hostile character must still produce ONE parseable line. The hand-rolled
+    /// writer made the log look broken when the path was merely unusual.
+    #[test]
+    fn a_firing_with_hostile_characters_still_round_trips() {
+        let db = PathBuf::from("/tmp/we\"ird\\path/nibdex.db");
+        let line = log_line(7, "served", "a\"b\\c\nd", true, 3, Some(&db));
+        assert_eq!(line.lines().count(), 1, "must be exactly one line: {line}");
+        let (f, skipped) = parse_log(&line);
+        assert_eq!(skipped, 0, "must parse as JSON: {line}");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].hits, 3);
+        assert_eq!(f[0].db, db.display().to_string(), "the path must survive verbatim");
+    }
+
+    /// `no_index` is the actionable outcome — it means the caller asked something
+    /// answerable and nothing covered their tree. When there are none, the report
+    /// must NOT print the pointer, or it reads as a standing complaint.
+    #[test]
+    fn stats_omits_the_no_index_pointer_when_there_are_none() {
+        let f = vec![firing(10, "served", 4, false)];
+        let out = render_stats(&f, 0, 20, Path::new("/x/log.jsonl"));
+        assert!(!out.contains("no index covers"), "{out}");
+    }
+
+    /// Unreadable lines must surface. Reporting only the survivors is how a
+    /// broken log passes as a quiet one.
+    #[test]
+    fn stats_surfaces_unreadable_lines() {
+        let f = vec![firing(10, "served", 4, false)];
+        let out = render_stats(&f, 3, 20, Path::new("/x/log.jsonl"));
+        assert!(out.contains("unreadable 3 line(s) skipped"), "{out}");
+    }
+
+    /// Rule 2 for the SECOND intent, and it carries the same weight as the
+    /// first: this runs on every Bash call. A build, a git command or a test run
+    /// must produce no tables and therefore no I/O at all.
+    #[test]
+    fn non_sql_commands_yield_no_tables() {
+        for cmd in [
+            "cargo test",
+            "git commit -m 'select the best option from the list'",
+            "ls -la",
+            "npm run build",
+            // The word appears, but as prose in a message — no FROM/JOIN/INTO
+            // follows, so nothing is extracted.
+            "echo 'insert your name here'",
+        ] {
+            assert!(tables_from_sql(cmd).is_empty(), "must not fire on: {cmd}");
+        }
+    }
+
+    /// The shapes that actually appear in a shell: a quoted -c argument, a
+    /// schema-qualified name, a join, and bracket quoting.
+    #[test]
+    fn sql_commands_yield_their_tables() {
+        assert_eq!(tables_from_sql("psql -c \"select * from orders\""), vec!["orders"]);
+        assert_eq!(
+            tables_from_sql("psql -c 'select o.id from sales.orders o join customers c on 1=1'"),
+            vec!["sales.orders", "customers"],
+            "a join names both, and the namespace is kept"
+        );
+        assert_eq!(
+            tables_from_sql("sqlcmd -Q \"SELECT TOP 1 * FROM [dbo].[Employees]\""),
+            vec!["[dbo].[Employees]"]
+        );
+        assert_eq!(tables_from_sql("psql -c 'update orders set x=1'"), vec!["orders"]);
+        assert_eq!(tables_from_sql("psql -c 'insert into orders values (1)'"), vec!["orders"]);
+    }
+
+    /// Introspection must NOT be answered from our own cached introspection.
+    /// It is circular, and worse, it would shadow the live answer a caller
+    /// deliberately went to the database for.
+    #[test]
+    fn introspection_queries_are_left_alone() {
+        assert!(tables_from_sql("psql -c \"select * from information_schema.columns\"").is_empty());
+        assert!(tables_from_sql("sqlcmd -Q \"select * from sys.columns\"").is_empty());
+    }
+
+    /// A subquery is not a table, and neither is a number. Both would otherwise
+    /// become a lookup for a name that cannot exist.
+    #[test]
+    fn subqueries_and_junk_are_not_tables() {
+        let t = tables_from_sql("psql -c 'select * from (select 1) x join real_table r on 1=1'");
+        assert!(!t.iter().any(|s| s.to_lowercase().starts_with("select")), "{t:?}");
+        assert!(t.contains(&"real_table".to_string()), "{t:?}");
+    }
+
+    /// Two is the cap. An injection that grows with the join count stops being
+    /// an answer and becomes a wall of text the reader learns to skip.
+    #[test]
+    fn at_most_two_tables_are_answered() {
+        let t = tables_from_sql("psql -c 'select 1 from a join b on 1=1 join c on 1=1 join d'");
+        assert_eq!(t.len(), 2, "{t:?}");
+    }
+
+    /// The rendering must date itself. A schema dump is a hand-taken snapshot
+    /// with nothing re-deriving it on a commit, so presenting it as current is
+    /// the confidently-wrong answer this corpus exists to prevent.
+    #[test]
+    fn schema_rendering_is_labelled_dated_and_defers_to_the_database() {
+        let hits = vec![crate::schema_index::SchemaHit {
+            database: "shopdb".into(),
+            schema: "public".into(),
+            name: "orders".into(),
+            object_type: "table".into(),
+            body: "shopdb.public.orders (table)\n  id integer NOT NULL\n".into(),
+        }];
+        let out = render_schema(&hits, "taken 3 days ago").expect("hits render");
+        assert!(out.contains("[nibdex]"), "must be attributable: {out}");
+        // "taken", not "indexed": the age must describe when the HUMAN dumped the
+        // schema, not when nibdex last walked the workspace. The old wording was
+        // true and measured the wrong event.
+        assert!(out.contains("taken 3 days ago"), "must state its age: {out}");
+        assert!(out.contains("id integer NOT NULL"), "{out}");
+        assert!(
+            out.contains("the database is right"),
+            "must defer to the live source on disagreement: {out}"
+        );
+        // Nothing to say, nothing injected.
+        assert!(render_schema(&[], "indexed today").is_none());
+    }
+
+    /// An empty sample must not report a median of zero — "no served firings" and
+    /// "served firings that returned nothing" are different facts.
+    #[test]
+    fn median_of_nothing_is_none_not_zero() {
+        assert_eq!(median(vec![]), None);
+        assert_eq!(median(vec![5]), Some(5));
+        assert_eq!(median(vec![20, 4, 12]), Some(12), "must sort before taking the middle");
     }
 }

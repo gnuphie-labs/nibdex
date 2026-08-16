@@ -2,6 +2,173 @@
 
 Notable changes per release. Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
 
+## 0.2.0-rc.3 — the hook becomes the front door; a schema corpus (unreleased)
+
+### `nibdex hook` is documented as the main path, not an optional extra
+It was listed last in the README under "Optional". On the author's own machine it
+is where essentially all real use happens, and the reason is structural: an MCP
+client can hold a tool's schema *deferred*, so reaching a query tool costs a
+lookup call that `grep` never pays, while `Bash` and `Grep` are resident and
+free. The README now leads with it, states that reason in one sentence, and
+carries the full honest list of what it will and won't do — Claude Code only, a
+`Bash` search must lead a pipeline segment, literal terms of 3+ characters,
+regex declined silently, needs an index covering your cwd, only as current as
+the last pass, fires on every `Bash` call, and logs search terms. New worked
+example in `docs/EXAMPLES.md` Q7, reproducible from a clone.
+
+### A sixth corpus: database schema
+`nibdex schema-dump-query --dialect postgres|mssql` prints an introspection
+query; save its output anywhere in the workspace as `*.nibdex-schema.json` and
+the next `nibdex index` picks it up. Tables, views and functions, with columns,
+types, widths, `NOT NULL` and defaults.
+
+nibdex reads the file — it holds no credentials and opens no socket, so the
+no-network posture is unchanged. The cost is that a dump is a snapshot; every
+answer states its age and defers to the database on disagreement.
+
+The payoff arrives through the hook, which now has a second intent: a shell
+command running SQL gets the shape of the tables it names, attached to a call
+you were already making. This is aimed at a measured cost — in one large
+workspace, 62% of sessions spent calls doing nothing but re-deriving a schema,
+and more failed on a guessed column name. The width half matters as much as the
+name half: a value compared against a column too narrow to hold it returns zero
+rows and reads as an empty result rather than a bug.
+
+Introspection queries (`information_schema`, `sys.*`) are deliberately left
+alone — answering those from our own cached introspection would be circular and
+would shadow the live answer you went to the database for.
+
+### `nibdex hook --stats`
+Reads `~/.nibdex/hook-log.jsonl` and reports firings, the served / no-hits /
+no-index split, the median hit count of served firings, a `refused` count for
+queries the index could not run, and a separate block for the schema intent —
+plus an `other` row naming any outcome the build does not recognise, so a
+future one cannot go missing from the buckets while still counting toward the
+total. The log already existed; nothing read it. A hook injection is not a tool call, so this and
+`check().adoption`'s new `hook_deliveries` are the only views of that path.
+
+`hook_deliveries` sits beside `nibdex_share_pct` rather than being folded into
+it: a delivery rides on a search already counted elsewhere, and the two numbers
+disagreeing is the finding, not a discrepancy to average away.
+
+### Seven fixes to the hook, found by driving it rather than reading it
+
+Every one of these survived a code review and a green suite, and every one shows
+up the moment you actually run the binary.
+
+- **`grep -e TERM path` searched for the PATH.** `-e` was treated as a flag whose
+  value must be skipped so it is not mistaken for the pattern — but its value
+  *is* the pattern, so the next bare argument was taken instead. The result was
+  not a miss: it was a labelled, provenance-stamped, freshness-stamped answer to
+  a question you did not ask, which is worse, because nothing prompts you to
+  doubt it. `-f` (patterns from a file) is now declined outright rather than
+  guessed at.
+- **A term containing `.` or `::` returned nothing at all.** The hook's query
+  path bound your term to FTS5 raw while every other caller sanitized first, so a
+  filename, a Rust path, a method call or a version string met the bareword
+  grammar and came back a syntax error — which the hook's fail-open then
+  swallowed. Sanitizing now happens inside the query function, where no caller
+  can forget it.
+- **A refused query is now counted.** That failure was invisible partly because
+  the query-error exit was the one outcome that wrote no log line, so `--stats`
+  could not report what it never recorded. It appears as `refused`.
+- **`--stats` and `hook_deliveries` were blind to the schema intent.** Every
+  firing counted toward the total while only the three search outcomes were
+  shown, so the percentages summed to under 100 with nothing explaining the gap,
+  and a workspace answering on every `psql` call could still report
+  `hook_deliveries: 0`. There is now a schema block, and an `other` row that
+  names any outcome this build does not recognise.
+- **A long line holding a non-ASCII character crashed the hook.** The hit body
+  was cut with a byte index, which panics mid-character. Under the documented
+  `2>/dev/null || true` wiring the panic is swallowed, so the answer is lost
+  silently — and since the log line is written after the render, the loss never
+  reached `--stats` either.
+- **The schema age described our indexing run, not your dump.** It read the time
+  the document was last indexed, which is refreshed on every pass, so a dump
+  taken a month ago and re-indexed this morning reported "indexed today". It now
+  reports the dump file's own timestamp, and says "taken", not "indexed".
+- **A workspace holding a dump and no indexed source was undiscoverable.** The
+  hook required a non-empty source corpus before a database counted as usable,
+  which is precisely the workspace the schema intent exists for. Either corpus
+  now qualifies.
+
+### The SQL Server dump query emitted storage bytes as a column width
+
+`sys.columns.max_length` is bytes and is populated for every type, so a dump
+described `id` as `bigint(8)` and — the damaging one — an `nvarchar(50)` column
+as `nvarchar(100)`, because a Unicode string stores two bytes per character. A
+width is a fact you act on without re-checking, so a wrong one is worse than
+none. The same query selected no column default at all, leaving that half of the
+rendering dead on SQL Server while PostgreSQL carried it.
+
+Both shared one cause worth stating plainly: that query had never been run against
+a real SQL Server. The PostgreSQL side was verified against a real dump; the SQL
+Server side against fixtures shaped like the PostgreSQL output, which cannot
+disagree with it.
+
+**It has now been run** — against two real SQL Server databases, with every width
+compared against the server's own `INFORMATION_SCHEMA.CHARACTER_MAXIMUM_LENGTH`.
+The old expression was wrong on **more than nine columns in ten**; the new one
+matches on every column of both. Doing that turned up two further defects that no
+amount of reading would have found:
+
+- **Widths are decided on the BASE system type**, not the declared one. `sysname`
+  is an alias for `nvarchar(128)` and reports 256 storage bytes under its own type
+  name, so a rule matching type names left it — and every
+  `CREATE TYPE … FROM nvarchar(n)` — with no width at all.
+- **The query now sets `NOCOUNT`**, because `sqlcmd` otherwise appends
+  `(N rows affected)` and the output is therefore not JSON. Anyone following the
+  old instructions got a file that could not be indexed.
+
+The PostgreSQL query needed no such repair, and the reason is the useful part: it
+asks `information_schema` for `character_maximum_length` and `column_default`
+rather than deriving them from storage bytes. Delegating beat computing.
+
+### Upgrading from 0.2.0-rc.2
+
+**Nothing is required.** Everything here is additive: no tool signature changed,
+no existing output shape changed, and an index built by rc.2 keeps working.
+
+If you want the new parts:
+
+- **Schema corpus** — there is nothing to enable. Produce a dump
+  (`nibdex schema-dump-query --help`) and run `nibdex index` once with the same
+  `--workspace`/`--db` your setup already uses. The `index` summary prints a
+  `schema:` line even when it finds none, so you can tell "no dump" from "not
+  looking". A migration adds the `schema_objects` table and runs automatically
+  at startup — but note that a **newer database than the binary serving it** is
+  an error, so upgrade every nibdex on that machine (the daemon, `~/.cargo/bin`,
+  and whatever path your hook invokes) rather than only one.
+- **The dump is not watched.** Re-running the dump does not re-index it; run
+  `nibdex index` after. Answers state the dump's age, so staleness is visible.
+- **`hook --stats`** reads a log that only starts accumulating once the hook is
+  wired, so an empty report on a fresh install is expected and says so.
+- **rc.2's source-prune** could delete a nested repo's code from `find_code` on
+  a commit to a container repo (a workspace root that is itself a repo, plus
+  `--include-nested-repos`). Fixed here. After upgrading, run `nibdex index`
+  once and confirm `check().indexer.documents.source` is unchanged.
+- **Regenerate any SQL Server dump taken with an earlier build.** Its
+  `nvarchar`/`nchar` widths are doubled and its fixed-width types carry a
+  meaningless one, and re-indexing cannot repair that — the wrong number is in
+  the file. Re-run `nibdex schema-dump-query --dialect mssql`, save over the old
+  dump, then `nibdex index`. PostgreSQL dumps are unaffected.
+- ⚠️ **The `sqlcmd` invocation changed, and the previous one never worked.** It
+  was documented as `sqlcmd -h -1 -y 0 -W …`; sqlcmd rejects that outright —
+  `-h` and `-W` are each mutually exclusive with `-y 0`, which is itself required
+  or the JSON is silently truncated mid-object. Use what the query header now
+  prints:
+
+  ```bash
+  sqlcmd -S SERVER -U USER -d YOURDB -y 0 -i this.sql | tr -d '\n' > db.nibdex-schema.json
+  ```
+
+  `sqlcmd` wraps the single long value across lines without altering it, so the
+  `tr` is a lossless reassembly. The PostgreSQL recipe is unchanged and was
+  re-verified against a live database.
+- **The hook's log writer now serializes properly** instead of stripping
+  characters from the recorded term. Lines written by earlier builds still parse;
+  there is nothing to do.
+
 ## 0.2.0-rc.2 — cold-review fixes (2026-08-15)
 
 Findings from an adversarial cold pre-publication review

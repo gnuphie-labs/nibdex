@@ -474,6 +474,7 @@ fn drift_check_result_fields_are_all_classified() {
             retrieval_elsewhere: 470,
             nibdex_queries: 0,
             nibdex_share_pct: 0.0,
+            hook_deliveries: 0,
         }),
     };
     let v = serde_json::to_value(&check).unwrap();

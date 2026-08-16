@@ -38,6 +38,14 @@ pub struct ScanStats {
     pub source_skipped_other_corpus: u32,
     /// D1a: previously-indexed source files no longer git-tracked, removed this pass.
     pub source_files_pruned: u32,
+    /// Schema dump files parsed and indexed.
+    pub schema_dumps: u32,
+    /// Tables, views and functions across those dumps.
+    pub schema_objects: u32,
+    /// Dumps that could not be read or parsed. Counted rather than swallowed —
+    /// an unreported failure leaves an empty corpus that reads as "no schema
+    /// here", which is a different and much more misleading fact.
+    pub schema_dumps_failed: u32,
     /// Transcript write-edges indexed (the `find_session` corpus).
     pub session_edges: u32,
     /// Transcripts read while gathering those edges, across every slug.
@@ -65,6 +73,7 @@ pub struct ScanStats {
     pub extract_design_docs_ms: u128,
     pub extract_commits_ms: u128,
     pub extract_source_ms: u128,
+    pub extract_schema_ms: u128,
     pub extract_session_edges_ms: u128,
     pub elapsed_ms: u128,
 }
@@ -404,6 +413,57 @@ pub async fn full_scan(
         }
     }
 
+    // 7. database schema — every `*.nibdex-schema.json` in the workspace.
+    //
+    // Cheap and last: normally one or two files, and it depends on nothing the
+    // other six steps produce. A malformed dump is reported and SKIPPED rather
+    // than failing the scan — six corpora have already committed by here, and
+    // the session step above sets the precedent for why aborting on the newest
+    // corpus is the wrong trade.
+    let schema_op = Op::start("extract.schema");
+    let schema_started = Instant::now();
+    for dump_path in list_schema_dumps(&workspace) {
+        if !keeps(&dump_path) {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&dump_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[nibdex index] {}: unreadable ({e})", dump_path.display());
+                stats.schema_dumps_failed += 1;
+                continue;
+            }
+        };
+        match crate::schema_index::parse_dump(&text, &dump_path) {
+            Ok(dump) => {
+                let document_id = upsert_document(pool, &dump_path, "schema").await?;
+                let n = crate::schema_index::persist_dump(pool, document_id, &dump).await?;
+                stats.schema_dumps += 1;
+                stats.schema_objects += n as u32;
+            }
+            Err(e) => {
+                // Named and counted. A dump that silently failed to parse would
+                // leave an empty corpus, and an empty corpus is indistinguishable
+                // from an absent one to every caller downstream.
+                eprintln!("[nibdex index] {e:#}");
+                stats.schema_dumps_failed += 1;
+            }
+        }
+    }
+    stats.extract_schema_ms = schema_started.elapsed().as_millis();
+    schema_op
+        .complete(
+            pool,
+            Some(stats.schema_dumps as i64),
+            Some(stats.schema_objects as i64),
+            json!({
+                "dumps": stats.schema_dumps,
+                "objects": stats.schema_objects,
+                "failed": stats.schema_dumps_failed,
+            }),
+        )
+        .await?;
+
     stats.elapsed_ms = started.elapsed().as_millis();
 
     let extra = json!({
@@ -412,6 +472,7 @@ pub async fn full_scan(
             "memory": stats.memory,
             "design_doc": stats.design_doc,
             "source": stats.source_files,
+            "schema": stats.schema_dumps,
         },
         "extractors": {
             "session_history": {
@@ -529,6 +590,39 @@ fn list_root_markdown(anchor: &Path) -> Vec<PathBuf> {
             .collect(),
         Err(_) => Vec::new(),
     };
+    out.sort();
+    out
+}
+
+/// Every schema dump in the workspace.
+///
+/// A BOUNDED walk, not a full one. This runs on every `full_scan` over a
+/// workspace that may hold tens of thousands of files, to find what is normally
+/// one or two — so it is depth-capped and skips the directories that dominate
+/// the file count without ever holding a dump. An unbounded walk would make the
+/// cheapest corpus the most expensive step, which is exactly the bloat the
+/// project's charter rejects.
+///
+/// Recursive rather than root-only on purpose: in a multi-repo workspace the
+/// dump belongs next to the service that owns the database, not at the top.
+fn list_schema_dumps(workspace: &Path) -> Vec<PathBuf> {
+    const SKIP: [&str; 6] = [".git", "node_modules", "target", ".next", "dist", "venv"];
+    let mut out: Vec<PathBuf> = walkdir::WalkDir::new(workspace)
+        .max_depth(6)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            !e.file_name().to_str().is_some_and(|n| SKIP.contains(&n))
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.ends_with(crate::schema_index::SCHEMA_DUMP_SUFFIX))
+        })
+        .collect();
     out.sort();
     out
 }

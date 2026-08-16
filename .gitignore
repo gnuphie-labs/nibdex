@@ -4,6 +4,11 @@
 *.db
 *.db.bak*
 *.bak-*
+# Pre-upgrade db copies and the adoption-baseline dumps. Both are generated,
+# both are machine-specific, and both were left untracked — which stalls the
+# release gate at step 0 rather than at anything that matters.
+*.db.pre-*
+nibdex-baseline-*.txt
 *.db-journal
 *.db-wal
 *.db-shm

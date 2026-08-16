@@ -236,6 +236,79 @@ Note what a domain database also *omits*: the memory corpus (unless that domain 
 
 ---
 
+## Q7 — `nibdex hook`: an answer with no tool call at all
+
+Everything above is an MCP tool call. This one isn't — and on the author's own machine it is where nearly all real use happens, because an MCP client can hold a tool's schema *deferred* while `Bash` and `Grep` are resident and free.
+
+**Reproducible from a public clone.** Index nibdex with itself, then feed the hook the event Claude Code would send:
+
+```bash
+nibdex index --workspace . --db /tmp/ex.db
+echo '{"tool_name":"Bash","cwd":"'$PWD'","tool_input":{"command":"grep -rn allow_silently src/"}}' \
+  | NIBDEX_HOOK_DB=/tmp/ex.db nibdex hook
+```
+
+The `additionalContext` it emits (wrapped in the `PreToolUse` envelope Claude Code reads):
+
+```
+[nibdex] 5 indexed hit(s) for "allow_silently" across 1 location(s) — index current, from ~/ws/ex.db.
+  from src:
+    src/hook.rs:851: allow_silently();  (via aa352aa)
+    src/hook.rs:901: allow_silently();  (via aa352aa)
+    src/hook.rs:951: allow_silently();  (via aa352aa)
+    src/hook.rs:1008: allow_silently();  (via aa352aa)
+    src/hook.rs:288: fn allow_silently() -> ! {  (via aa352aa)
+  (each hit carries the commit that last touched it; the shell search below still ran and is authoritative for uncommitted work)
+```
+
+The `grep` still ran. What the index added is what `grep` structurally cannot: every hit stamped with the commit that last touched it, and the definition surfaced alongside its four call sites.
+
+### The same hook, on a SQL command
+
+The second intent needs no database to try — write the dump by hand:
+
+```bash
+mkdir -p /tmp/demo && cat > /tmp/demo/shop.nibdex-schema.json <<'JSON'
+{"database": "shop", "objects": [
+  {"name": "orders", "columns": [
+    {"name": "id", "type": "bigint", "nullable": false},
+    {"name": "customer_code", "type": "character varying", "nullable": false, "max_len": 12},
+    {"name": "status", "type": "text", "nullable": false, "default": "'new'::text"},
+    {"name": "placed_at", "type": "timestamp with time zone", "nullable": true}
+  ]}
+]}
+JSON
+nibdex index --workspace /tmp/demo --db /tmp/demo.db
+echo '{"tool_name":"Bash","cwd":"/tmp/demo","tool_input":{"command":"psql -d shop -c \"select id from orders where customer_code = 12345\""}}' \
+  | NIBDEX_HOOK_DB=/tmp/demo.db nibdex hook
+```
+
+```
+[nibdex] schema for orders — from an indexed dump, indexed today.
+  shop.public.orders (table)
+    id bigint NOT NULL
+    customer_code character varying(12) NOT NULL
+    status text NOT NULL DEFAULT 'new'::text
+    placed_at timestamp with time zone
+  (a dump is a snapshot, not a live read — if this disagrees with the database, the database is right)
+```
+
+Look at the query that triggered it: `customer_code = 12345`, against a column declared `character varying(12)`. That comparison is the failure this corpus is really for — not the round trip it saves, but the mismatch that would otherwise return zero rows and look like an empty result rather than a bug. Reading the query never reveals it; the width is only in the schema.
+
+**Two honest limits.** A delivery is not a use — the log records that an answer was attached, never that it was read. And a dump is only as current as the last indexing pass, which is why the age is stated in every answer rather than assumed. `nibdex hook --stats` reports the split:
+
+```
+nibdex hook — 14 firings, 21 h ago → 7 min ago
+
+  served        3   21.4%   median 2 hits
+  no_hits      11   78.6%
+  no_index      0    0.0%
+```
+
+A high `no_hits` share is worth chasing rather than hiding: it usually means the index does not cover what is actually being searched.
+
+---
+
 ## `check()` — corpus census, perf, and honest cost figures
 
 ```jsonc

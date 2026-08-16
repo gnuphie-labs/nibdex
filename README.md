@@ -2,7 +2,7 @@
 
 > **An always-available MCP knowledge tool for the keystone resources every dev environment already has — source code, git history, design docs, memory, and AI session history — surfaced together and kept current, derived from the workspace rather than hand-curated.**
 
-**Status:** pre-1.0, and honestly early. The core works end-to-end on real workspaces — five corpora indexed, seven query tools live, every code hit carrying the git commit that last touched its file — and it's dogfooded daily on the author's own projects. It's also young: the usage numbers are small, several rough edges are written down in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), and the [roadmap](#roadmap) is still most of the story. The aim isn't to look finished — it's to be honest about where it stands and grow it into something genuinely solid, in the open.
+**Status:** pre-1.0, and honestly early. The core works end-to-end on real workspaces — six corpora indexed, seven query tools plus a [shell hook](#nibdex-hook--the-index-at-greps-price) that answers without one, every code hit carrying the git commit that last touched its file — and it's dogfooded daily on the author's own projects. It's also young: the usage numbers are small, several rough edges are written down in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), and the [roadmap](#roadmap) is still most of the story. The aim isn't to look finished — it's to be honest about where it stands and grow it into something genuinely solid, in the open.
 
 **Platform support:** macOS and Linux. nibdex uses libgit2 (no external `git` binary at runtime) and a target-native filesystem watcher (FSEvents on macOS, inotify on Linux). Windows support is **in progress** — the code is cross-platform and the build is target-gated (vendored libgit2), but it has not yet been built or run on real Windows hardware. See [`WINDOWS_BUILD.md`](WINDOWS_BUILD.md).
 
@@ -10,7 +10,7 @@
 
 ## What it is
 
-A single-binary Rust MCP server that indexes **five corpora** — source code, git commits, AI session history, memory files, and design docs — into one SQLite + FTS5 surface, exposes them as **seven query tools plus `check()`**, and emits a JSONL event stream with an optional per-call cost-savings ledger. Code hits come back with the git commit that last touched their file, so retrieval carries its own provenance; on a working tree that has drifted since indexing, a hit reports whether its location is still `verified`, was `relocated` to the current line, has gone `stale`, or is `file_missing`.
+A single-binary Rust MCP server that indexes **six corpora** — source code, git commits, AI session history, memory files, design docs, and database schema — into one SQLite + FTS5 surface, exposes them as **seven query tools plus `check()`** *and* a [shell hook](#nibdex-hook--the-index-at-greps-price) that answers without a tool call at all, and emits a JSONL event stream with an optional per-call cost-savings ledger. Code hits come back with the git commit that last touched their file, so retrieval carries its own provenance; on a working tree that has drifted since indexing, a hit reports whether its location is still `verified`, was `relocated` to the current line, has gone `stale`, or is `file_missing`.
 
 The differentiation claim (DESIGN §3): no existing tool surfaces **source code + git commits + session history + memory + design docs** *together* as structured records sharing one ranking surface, code and session hits anchored to a provenance commit. Per-corpus tools (`git log`, `ripgrep`, a curated-KB tool) each cover a slice; nibdex covers the cross-corpus join those tools can't reach without an AI synthesis step.
 
@@ -18,7 +18,7 @@ The differentiation claim (DESIGN §3): no existing tool surfaces **source code 
 
 ```bash
 # 1. Install — from crates.io (pre-release, so the version is explicit) …
-cargo install nibdex --version 0.2.0-rc.2
+cargo install nibdex --version 0.2.0-rc.3
 #    … or from source
 git clone https://github.com/gnuphie-labs/nibdex.git nibdex && cd nibdex && cargo build --release
 #    (then use ./target/release/nibdex in place of nibdex below)
@@ -51,13 +51,70 @@ For an always-on daemon with file-watcher incremental indexing instead of stdio:
 
 The HTTP MCP transport binds loopback-only at MVP (see [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) §1).
 
+## `nibdex hook` — the index at `grep`'s price
+
+**Set this up. On the author's own machine it is where essentially all real use happens**, and the reason is structural rather than a matter of taste: an MCP client can hold a tool's schema *deferred*, so reaching `find_code` costs a lookup call before the call — a toll `grep` never pays. `Bash` and `Grep` are resident and free. Riding them delivers the index's answer at `grep`'s price, which no amount of making the tools nicer can achieve.
+
+It is a Claude Code `PreToolUse` hook with two intents:
+
+- **A shell search** (`grep`/`rg`/`ack`/`ag`, or the `Grep` tool) → the matching indexed code, grouped by location, each hit carrying the commit that last touched it.
+- **A SQL command** (`psql`/`sqlcmd`/`mysql`/… running a `SELECT`/`UPDATE`/`INSERT`/`DELETE`) → the shape of the tables it names, from the [schema corpus](#database-schema-optional): columns, types, widths, `NOT NULL`, defaults.
+
+**It augments, never intercepts.** The command still runs, so the live result stays authoritative and nothing an index says can pose as a live read.
+
+```jsonc
+// .claude/settings.json — and keep the suffix, see below
+{"hooks": {"PreToolUse": [{"matcher": "Bash|Grep", "hooks": [
+  {"type": "command", "command": "nibdex hook 2>/dev/null || true"}]}]}}
+```
+
+`nibdex hook --help` prints this. ⚠️ **Wire it with `2>/dev/null || true`, not bare.** The hook fails open, but only once it is *reached*: an older binary without the subcommand makes the argument parser exit non-zero first, and a non-zero `PreToolUse` hook **blocks the tool**. That has happened for real.
+
+**What it will and won't do — the honest list:**
+
+- **Claude Code only.** It speaks the `PreToolUse` contract; other MCP clients have no equivalent.
+- **A `Bash` search must lead a pipeline segment.** `cargo test | grep x` is trimming a build log, not asking the index anything, and is left alone.
+- **Literal terms of 3+ characters.** A regex is declined, and declined *silently* — there is nothing useful to say about a pattern the index cannot answer.
+- **It needs an index covering your current directory** — the nearest `nibdex.db` upward, or `NIBDEX_HOOK_DB`. With none, it is silent.
+- **It is only as current as the last indexing pass**, and says so in every answer.
+- **It fires on every `Bash` call**, so a non-search is rejected before any I/O. Measure that on your own machine before taking anyone's word that it is cheap.
+- **It logs.** One JSON line per firing — outcome, the search term, hit count, db path; never file contents — appended to `~/.nibdex/hook-log.jsonl` (see [`SECURITY.md`](SECURITY.md)). `nibdex hook --stats` reads it back: firings, the served/no-hits/no-index split per intent, a `refused` count for queries the index could not run, and the median hit count. Any outcome a build does not recognise is shown as `other` rather than counted into a total and left unexplained. `NIBDEX_HOOK_OFF=1` disables the hook entirely.
+
+A delivery is not a use: the log can show an answer was attached, never that it helped. `check().adoption` reports `hook_deliveries` beside `nibdex_share_pct` for the same reason — they measure different things and merging them would hide which path is working.
+
+## Database schema (optional)
+
+`find_code` tells you what the code says; this tells you what the database *is*. Point nibdex at a schema dump and a query naming a table gets that table's columns, types and widths without a round trip — including through the hook, so the answer arrives attached to the `psql` call you were already making.
+
+```bash
+nibdex schema-dump-query --dialect postgres > /tmp/q.sql
+psql -At -d YOURDB -f /tmp/q.sql > app.nibdex-schema.json   # anywhere in the workspace
+nibdex index --workspace ~/your/workspace                   # picks it up by name
+```
+
+`--dialect mssql` emits the SQL Server equivalent. Any file ending `.nibdex-schema.json` is a dump; there is nothing to configure.
+
+⚠️ **This corpus has no query tool — it is delivered by [the hook](#nibdex-hook--the-index-at-greps-price), and the hook is Claude Code only.** Five of the six corpora have a `find_*` tool; this one does not, deliberately: an eighth tool would be held deferred like the other seven and called as rarely, while the hook attaches the answer to a `psql` call you were already making. The consequence is worth knowing before you build a dump — **on any other MCP client you can index a schema and have no way to read it.** See [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md).
+
+**nibdex reads a file, never your database.** It holds no credentials and opens no socket — the no-network posture in [`SECURITY.md`](SECURITY.md) is worth more than the freshness a live connection would buy. The cost is that a dump is a snapshot: re-run it when the schema changes. Every answer states how old the dump is and defers to the database on disagreement, so staleness is visible rather than silent. Views and functions are indexed too, which is the part with no alternative — a predicate inside a view body is not greppable in a source tree.
+
 ## Wiring to your MCP client
 
-After `nibdex index` populates a DB, expose it to an MCP client one of two ways. `nibdex print-mcp-config` emits the right JSON for your install if you'd rather generate than hand-edit.
+After `nibdex index` populates a DB, expose it to an MCP client. There are three shapes, and the real choice is **what keeps the index current** — the transport is secondary:
+
+| | keeps the index current | transport | runs when your editor doesn't |
+|---|---|---|---|
+| `serve --http` | yes | HTTP | yes |
+| `watch` + stdio | yes | stdio | yes |
+| stdio alone | **no** | stdio | no |
+
+The first two make the same bargain: one small background process re-indexes as you commit, so answers track your tree without you thinking about it. **Start there.** The third runs nothing you did not start, and the index then stays exactly as your last `nibdex index` left it — a snapshot that looks precisely like a fresh one, since a stale answer arrives labelled and provenance-stamped like any other. That is a legitimate way to work, and it is documented in [Keeping it current without a daemon](#keeping-it-current-without-a-daemon); it should be a decision, not a default you fell into.
+
+`nibdex print-mcp-config` emits the right JSON for your install if you'd rather generate than hand-edit.
 
 ### HTTP (recommended for active workspaces)
 
-Requires `nibdex serve` running. Cross-session warmth and file-watcher incremental indexing. Add to `<workspace>/.mcp.json`:
+Requires `nibdex serve` running. One process serves every session, so the cache stays warm and there is only ever one binary image to reason about. Add to `<workspace>/.mcp.json`:
 
 ```json
 {
@@ -72,9 +129,19 @@ Requires `nibdex serve` running. Cross-session warmth and file-watcher increment
 
 Or generate it: `nibdex print-mcp-config --transport http --http 127.0.0.1:7878 > .mcp.json`
 
-### Stdio (no daemon, per-session cold cache)
+**Confirm it is actually running.** A daemon is a background process, and a stopped one looks exactly like a quiet index — no error, just no answers. With this transport there is no fallback: if `serve` is down, every query tool is simply unavailable.
 
-Reads the on-disk DB; one nibdex process per MCP session, exits at session end. Claude Code one-liner:
+```bash
+curl -s 127.0.0.1:7878/healthz
+```
+
+That returns the corpus counts and the `git_sha` of the build that is **running**, which is not necessarily the one `nibdex version` reports on disk. When those two disagree you have upgraded the binary and not restarted the daemon — check both, not either.
+
+### Stdio (no daemon required, per-session cold cache)
+
+Reads the on-disk DB; one nibdex process per MCP session, exits at session end. Nothing stops you running `nibdex serve` as well, and it is worth knowing why: **the file watcher belongs to `serve`, not to a transport.** A stdio client pointed at the same DB sees everything the watcher has indexed, background work included, whether or not any editor is open. What stdio gives up is warmth and single-process clarity — a session holds the binary image it started with, so upgrading mid-session leaves the client and the daemon on different builds until the client restarts.
+
+Claude Code one-liner:
 
 ```bash
 claude mcp add nibdex -- /path/to/nibdex mcp --db /path/to/nibdex.db
@@ -94,6 +161,21 @@ Or hand-write to `<workspace>/.mcp.json`:
 ```
 
 Or generate it: `nibdex print-mcp-config --transport stdio --db ./nibdex.db > .mcp.json`
+
+### Keeping it current without a daemon
+
+`nibdex mcp` only reads. Nothing re-indexes while it runs, so with no daemon at all your answers are as old as your last `nibdex index` — and **nothing in an answer tells you that number stopped moving.** The freshness stamp reports the index's age honestly; it cannot report that no one is maintaining it.
+
+The cheap fix needs no daemon and matches how the index is built anyway, since the commit is what nibdex anchors code to:
+
+```bash
+# .git/hooks/post-commit   (chmod +x)
+nibdex index --workspace ~/your/workspace --db ~/your/workspace/nibdex.db
+```
+
+Unchanged files are skipped by content hash, so a pass after a small commit is dominated by the files that actually changed. Add `--include-nested-repos` if your workspace root is itself a repo.
+
+If you want currency without opening a port, **`nibdex watch`** runs the file-watcher on its own — the same incremental indexing `serve` does, no HTTP listener, and your MCP client stays on stdio.
 
 Other MCP clients (Claude Desktop, Cursor, etc.) accept the same JSON shape with client-specific config-file locations — check your client's docs.
 
@@ -130,10 +212,6 @@ Two honest caveats specific to this corpus:
 If you work across multiple clients or employers on one machine, this is the corpus most likely to mix them — see [Separating IP domains](#separating-ip-domains-optional) below.
 
 > **Legacy CLAUDE.md session format.** Earlier nibdex parsed session entries from a specific `## Recent session history` CLAUDE.md shape. That corpus is still extracted but **no longer queried** — the transcript map above replaces it — and it will be removed in a future release.
-
-## Optional: ride `grep` with `nibdex hook`
-
-`nibdex hook` is a Claude Code `PreToolUse` hook that, when the tool call is a shell search (`grep`/`rg`/`ack`/`ag`) or the `Grep` tool, attaches the index's answer as `additionalContext` — the search still runs, so the live result stays authoritative. It fails open (any error → nothing emitted, tool proceeds), finds the nearest `nibdex.db` that covers the current directory (or `NIBDEX_HOOK_DB`), reads it without creating or migrating anything, and labels every answer with the age of the last indexing pass. Wire it as `nibdex hook --help` shows (with the `2>/dev/null || true` suffix). Two things to know: it appends one JSON line per firing — outcome, the search term, hit count, db path; never file contents — to `~/.nibdex/hook-log.jsonl` (see [`SECURITY.md`](SECURITY.md)), and `NIBDEX_HOOK_OFF=1` disables it entirely.
 
 ## Separating IP domains (optional)
 

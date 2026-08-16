@@ -20,6 +20,7 @@ mod metrics;
 mod metrics_export;
 mod metrics_sink;
 mod rescore;
+mod schema_index;
 mod session_index;
 mod source_index;
 mod triage;
@@ -40,10 +41,25 @@ use crate::metrics_sink::{MetricsSink, MetricsSinkSpec};
 async fn main() -> Result<()> {
     let args = cli::Args::parse();
     match args.command {
-        cli::Command::Hook => {
+        cli::Command::Hook { stats } => {
             // Never returns; every path exits 0 so a hook failure can never
             // break the caller's own search.
+            if stats {
+                hook::stats();
+            }
             hook::run().await;
+        }
+        cli::Command::SchemaDumpQuery { dialect } => {
+            match schema_index::dump_query(&dialect) {
+                Some(q) => print!("{q}"),
+                // Named alternatives rather than a bare "unknown": the whole
+                // point of shipping the query is that the user should not have
+                // to go looking, and an error that sends them looking anyway
+                // has given the cost back.
+                None => anyhow::bail!(
+                    "unknown dialect {dialect:?} — supported: postgres, mssql"
+                ),
+            }
         }
         cli::Command::Index {
             workspace,
@@ -974,13 +990,14 @@ fn print_summary(
     prior_commits: Option<&metrics::Measurement>,
 ) {
     println!(
-        "Indexed {} documents in {}ms (session_history={}, memory={}, design_doc={}, source={}).",
+        "Indexed {} documents in {}ms (session_history={}, memory={}, design_doc={}, source={}, schema={}).",
         stats.total(),
         stats.elapsed_ms,
         stats.session_history,
         stats.memory,
         stats.design_doc,
-        stats.source_files
+        stats.source_files,
+        stats.schema_dumps
     );
     println!(
         "  session_entries: {} (extract.session_history {}ms)",
@@ -1009,6 +1026,22 @@ fn print_summary(
         stats.source_skipped_other_corpus,
         stats.source_files_pruned,
         stats.extract_source_ms,
+    );
+    // Printed even at zero, unlike the other lines' details: a workspace with no
+    // dump should SEE that the corpus exists and is empty, because the whole
+    // failure mode of this corpus is a user who never learns it is available.
+    println!(
+        "  schema: {} object(s) across {} dump(s){} (extract.schema {}ms)",
+        stats.schema_objects,
+        stats.schema_dumps,
+        if stats.schema_dumps_failed > 0 {
+            format!(" ({} failed to parse)", stats.schema_dumps_failed)
+        } else if stats.schema_dumps == 0 {
+            " — none found; `nibdex schema-dump-query --help` to add one".to_string()
+        } else {
+            String::new()
+        },
+        stats.extract_schema_ms,
     );
     println!(
         "  session_edges: {} new, {} already indexed, across {} transcript(s) \

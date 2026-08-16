@@ -253,6 +253,15 @@ pub async fn index_source_repo(pool: &SqlitePool, repo: &Path) -> Result<SourceI
         if tracked.contains(&path) {
             continue;
         }
+        // A NESTED repo's files sit under this prefix too (`--include-nested-repos`
+        // with a workspace root that is itself a repo) but are tracked by THAT
+        // repo, not this one — they must not be pruned by the container's pass.
+        // Seen live: the container pruned 268 nested-repo documents, which the
+        // nested passes then rewrote from scratch on every index. Skip anything
+        // that has a `.git` (dir or worktree file) between it and this root.
+        if belongs_to_nested_repo(repo, Path::new(&path)) {
+            continue;
+        }
         wipe_existing_chunks(&mut tx, doc_id).await?;
         sqlx::query("DELETE FROM documents WHERE id = ?")
             .bind(doc_id)
@@ -264,6 +273,22 @@ pub async fn index_source_repo(pool: &SqlitePool, repo: &Path) -> Result<SourceI
     tx.commit().await?;
     stats.elapsed_ms = started.elapsed().as_millis();
     Ok(stats)
+}
+
+/// Is `abs` inside a git repo nested BELOW `root` (a `.git` dir or worktree file
+/// on some ancestor strictly between `abs`'s parent and `root`)?
+fn belongs_to_nested_repo(root: &Path, abs: &Path) -> bool {
+    let mut dir = abs.parent();
+    while let Some(d) = dir {
+        if d == root {
+            return false;
+        }
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// Modified-time as unix secs — the one derivation shared by the extractor and
@@ -787,6 +812,26 @@ pub async fn find_code(pool: &SqlitePool, query: &str, limit: i64) -> Result<Vec
 /// Exact equality on the stored root, never a substring. A substring test is what
 /// produced the defect this exists to fix — a search scoped to `src/` inside one
 /// repo was answered from another repo's `src/`, because every repo has one.
+///
+/// ⚠️ THE QUERY IS SANITIZED HERE, INSIDE, and that placement is the fix.
+/// `sanitize_fts5_query`'s own contract says the repair "lives here and is applied
+/// at all of those sites" — and it was, at the CLI arm (`main.rs`) and at every
+/// `mcp::query` tool, but NOT at this function, which is the one `hook` calls on
+/// every shell search. So a term holding a `.` or a `:` — a filename, a Rust path,
+/// a method call, a version string — reached FTS5's bareword grammar raw and came
+/// back a syntax error, which the hook's fail-open then swallowed whole. Driving
+/// the release binary: `grep -rn std::fs src/` and `grep -rn schema_index.rs src/`
+/// each emitted nothing, while `render_object` served 3 hits. Corroborated on a
+/// real 30-firing log: ZERO firings carried a term containing `.` or `:`, in a
+/// Rust and TypeScript workspace. Sanitizing at the call sites left the most
+/// important caller uncovered for as long as it existed; sanitizing in here means
+/// no future caller can forget. Double-sanitizing is a no-op — an already-quoted
+/// token contains `"` and passes through untouched — so `main.rs` is unaffected.
+///
+/// NOT broadened, deliberately: `mcp::query` retries an unsatisfiable multi-term
+/// query as an OR, but the hook is unsolicited, so widening the caller's question
+/// is exactly the thing it must not do. Sanitizing repairs the grammar; broadening
+/// would change the question.
 pub async fn find_code_in_repo(
     pool: &SqlitePool,
     query: &str,
@@ -842,7 +887,7 @@ pub async fn find_code_in_repo(
              LIMIT ? \
          )",
     )
-    .bind(query)
+    .bind(crate::mcp::sanitize_fts5_query(query))
     .bind(repo)
     .bind(repo)
     .bind(limit)
@@ -1369,6 +1414,32 @@ mod tests {
             .unwrap()
     }
 
+    /// A term holding `.` or `::` must reach FTS5 SANITIZED — the shapes a
+    /// developer actually greps for.
+    ///
+    /// This function is the hook's query path, and it bound the raw term to
+    /// `body MATCH ?` while every other caller sanitized. FTS5's bareword grammar
+    /// then rejected the query outright, the hook's fail-open swallowed the error,
+    /// and the search silently produced nothing. The mutation that proves this
+    /// test: drop the `sanitize_fts5_query` call and every `is_ok()` below fails
+    /// with a syntax error, which is exactly what shipped.
+    #[tokio::test]
+    async fn a_dotted_or_colon_term_reaches_fts5_sanitized() {
+        let (_tmp, pool) = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        commit_file(&repo, "a.rs", "use std::fs;\nfn read_schema_index() {}\n", "add a");
+        index_source_repo(&pool, dir.path()).await.unwrap();
+
+        for term in ["std::fs", "schema_index.rs", "v0.2.0-rc.3", "acme-dashboard"] {
+            let hits = find_code(&pool, term, 10).await;
+            assert!(hits.is_ok(), "FTS5 rejected {term:?}: {:?}", hits.err());
+        }
+        // Surviving is not enough — the repaired query must still ANSWER.
+        let hits = find_code(&pool, "std::fs", 10).await.unwrap();
+        assert!(!hits.is_empty(), "sanitized `std::fs` must still find the line it is on");
+    }
+
     /// The extractor must actually STAMP the repo on every chunk it writes.
     ///
     /// The query-layer repo-scope tests seed `source_chunks` directly, so all of
@@ -1521,6 +1592,41 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fts_hits, 0, "FTS rows of the pruned file are gone");
+    }
+
+    /// The container repo's prune pass must not touch a NESTED repo's documents
+    /// (workspace root that is itself a repo + `--include-nested-repos`). Seen
+    /// live on the rc.2 deploy: 268 nested docs pruned and rewritten every pass.
+    /// Mutation this catches: dropping the `belongs_to_nested_repo` guard →
+    /// the nested doc is gone after the container's pass (files_pruned == 1).
+    #[tokio::test]
+    async fn container_prune_leaves_nested_repo_documents_alone() {
+        let (_tmp, pool) = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outer = init_repo(&root);
+        commit_file(&outer, "top.rs", "fn top_entry() {}\n", "outer");
+        let inner_dir = root.join("inner");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+        let inner = init_repo(&inner_dir);
+        commit_file(&inner, "deep.rs", "fn deep_entry() {}\n", "inner");
+
+        // Index the nested repo first, then the container (the order the
+        // discovery sort produces is container-first, but either order must hold).
+        index_source_repo(&pool, &inner_dir).await.unwrap();
+        let s = index_source_repo(&pool, &root).await.unwrap();
+        assert_eq!(s.files_pruned, 0, "the container must not prune inner/deep.rs");
+        let docs: Vec<String> =
+            sqlx::query_scalar("SELECT path FROM documents WHERE kind = 'source' ORDER BY path")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(docs.len(), 2, "{docs:?}");
+        assert!(docs.iter().any(|p| p.ends_with("inner/deep.rs")));
+        // And a second container pass is a no-op rewrite-wise.
+        let s2 = index_source_repo(&pool, &root).await.unwrap();
+        assert_eq!((s2.files_pruned, s2.files_indexed), (0, 0));
+        assert_eq!(s2.files_unchanged, 1);
     }
 
     /// Binary and non-UTF-8 files are skipped, not lossily indexed: a NUL-bearing

@@ -57,7 +57,41 @@ pub enum Command {
     /// blocked every Bash call in the session. The suffix guarantees exit 0 for
     /// a missing binary, a missing subcommand, or any crash, while still passing
     /// valid JSON through on stdout.
-    Hook,
+    Hook {
+        /// Report what the hook has done, instead of acting as a hook.
+        ///
+        /// Reads `~/.nibdex/hook-log.jsonl` and prints firings, the
+        /// served/no_hits/no_index split per intent, a `refused` count for
+        /// queries the index could not run, and the median hit count. An
+        /// outcome this build does not recognise is shown as `other` rather
+        /// than counted into the total and left unexplained. A hook injection
+        /// is not a tool call, so this is the ONLY view of the augment path —
+        /// `check().adoption` counts tool calls and cannot see it.
+        #[arg(long)]
+        stats: bool,
+    },
+
+    /// Print the introspection query that produces a schema dump.
+    ///
+    /// nibdex indexes the SHAPE of the databases your workspace talks to, so it
+    /// can answer "what columns does this table have" without a round trip. It
+    /// reads a dump file rather than connecting: no credentials, no socket, and
+    /// the same handling for PostgreSQL and SQL Server.
+    ///
+    /// Save the output anywhere in the workspace with a name ending
+    /// `.nibdex-schema.json` and the next index picks it up — nothing to
+    /// configure.
+    ///
+    ///     nibdex schema-dump-query --dialect postgres > /tmp/q.sql
+    ///     psql -At -d YOURDB -f /tmp/q.sql > app.nibdex-schema.json
+    ///
+    /// Re-run it whenever the schema changes; a dump is only as current as the
+    /// day it was taken, and every answer says how old it is.
+    SchemaDumpQuery {
+        /// postgres | mssql
+        #[arg(long, default_value = "postgres")]
+        dialect: String,
+    },
 
     /// Run a full scan over the workspace and populate the documents table.
     Index {

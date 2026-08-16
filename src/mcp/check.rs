@@ -6,6 +6,7 @@
 //! (see `docs/MCP_SPLIT_PLAN.md`).
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -84,6 +85,24 @@ fn retired_corpora(indexer: &IndexerCounts) -> Option<Vec<RetiredCorpus>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Which file this pool is actually open on.
+///
+/// Asked of SQLite rather than threaded down from the caller, because the four
+/// `run_check` call sites do not all have the path and one of them (the export)
+/// has no CLI arguments at all. `pragma_database_list` answers for the
+/// connection in hand, which is the thing that matters — the point of the
+/// question is scoping a machine-global log to THIS index, so a path the caller
+/// believes in is worth less than the one actually opened. An in-memory database
+/// reports an empty string and yields `None`.
+async fn db_path_of(pool: &SqlitePool) -> Option<PathBuf> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_optional(pool)
+            .await
+            .ok()?;
+    row.map(|(f,)| f).filter(|f| !f.is_empty()).map(PathBuf::from)
+}
+
 /// The denominator (see [`Adoption`]). `None` when no session activity has been
 /// indexed, so a workspace that has never run the session pass gets a clean
 /// `check()` rather than a misleading 0%.
@@ -105,11 +124,21 @@ async fn compute_adoption(pool: &SqlitePool) -> Result<Option<Adoption>> {
         return Ok(None);
     }
     let total = retrieval_elsewhere + nibdex_queries;
+    // The augment path is invisible to everything above: a hook injection is not
+    // a tool call, so a session served entirely by the hook counts as pure
+    // `retrieval_elsewhere` and nibdex reads as unused. Scoped to the database
+    // this check is running against — the log is machine-global, and an unscoped
+    // count would re-introduce the every-workspace bug rc.2 fixed.
+    let hook_deliveries = match db_path_of(pool).await {
+        Some(p) => crate::hook::deliveries_for(&p),
+        None => 0,
+    };
     Ok(Some(Adoption {
         sessions_seen,
         sessions_using_nibdex,
         retrieval_elsewhere,
         nibdex_queries,
+        hook_deliveries,
         // Rounded to one decimal so a tiny share reads as a tiny share rather
         // than disappearing into 0.
         nibdex_share_pct: if total == 0 {
