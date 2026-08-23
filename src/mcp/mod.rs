@@ -21,6 +21,7 @@ use crate::metrics_sink::MetricsSink;
 mod check;
 mod format;
 mod fts5;
+mod neighbourhood;
 mod query;
 mod server;
 mod telemetry;
@@ -34,7 +35,7 @@ mod tests;
 // and the CLI `find-code` arm imports `sanitize_fts5_query` so the human-typed
 // quickfix path gets the same FTS5-syntax safety as the MCP tools (a raw hyphen
 // query crashes bare MATCH — the §9.1 measurement gear's bonus finding 2).
-pub(crate) use self::check::run_check;
+pub(crate) use self::check::{compute_indexer_counts, run_check};
 pub(crate) use self::fts5::sanitize_fts5_query;
 pub(crate) use self::server::serve_stdio;
 pub(crate) use self::types::{CheckResult, IndexerCounts, OrphanCounts, Stages};

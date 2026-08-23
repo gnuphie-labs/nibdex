@@ -20,6 +20,24 @@ pub(crate) const DEFAULT_LIMIT: i64 = 10;
 pub(crate) const DEFAULT_DAYS: i64 = 30;
 
 /// Per D-6.1.2 summary key: first 200 chars of body, ASCII-safe word-boundary truncation.
+/// How deep to SCAN, as opposed to how much to RENDER.
+///
+/// Measured against the 416-row labelled set (docs/QUERY_QUALITY_DESIGN.md §6d):
+/// widening the window from 10 to 50 recovered 15 further files the session actually
+/// opened, at ranks 11–37, median 19 — while `hit@1` and `hit@3` did not move at all.
+/// The head of the ranking is unaffected by depth; only the tail is. Scanning to 40
+/// recovers all 15.
+///
+/// 🔑 WHY THIS IS A CONSTANT AND NOT A DECISION. The obvious design is to predict when
+/// a query needs more depth and go deeper only then. That was tested and there is no
+/// usable predictor: bm25 spread runs 2.916 on misses vs 4.075 on hits, and window
+/// saturation 76% vs 67% — both directional, both overlapping far too heavily to gate
+/// on. But no predictor is NEEDED, because the two costs are asymmetric (DESIGN §3.1):
+/// query latency is nearly free (10–20 ms against the shell's 400–540 ms) while
+/// caller-side BYTES are the only scarce resource. So never decide whether to look —
+/// always look, and control cost at the RENDERING end instead.
+pub(crate) const DEEP_SCAN_DEPTH: i64 = 40;
+
 pub(crate) const SUMMARY_CHAR_LIMIT: usize = 200;
 /// D-10.11: per-section inline body cap for `find_design_doc` (chars). Larger than
 /// `SUMMARY_CHAR_LIMIT` so a section is usually usable inline, but bounded so one fat
@@ -47,6 +65,26 @@ pub(crate) const CHECK_SCHEMA_VERSION: i64 = 1;
 // =====================================================================================
 // Shared envelopes and result structs
 // =====================================================================================
+
+/// One file that matched below the rendered window — a pointer, never a body.
+///
+/// The rendered results answer "what does this say"; these answer "where else did it
+/// match". Deduped by file, because ranks 11–40 are frequently several chunks of the
+/// same document and repeating it would spend the bytes this whole design is trying
+/// not to spend.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AlsoMatched {
+    /// Openable as-is: absolute for source hits (`repo_path` joined to the
+    /// repo-relative `path`), and already absolute for design-doc hits. A path the
+    /// caller must anchor themselves is a path they can resolve against the wrong
+    /// repo — see gnuphie-labs#8.
+    pub path: String,
+    /// Best (highest-ranked) matching line in that file, so the pointer is a jump
+    /// target rather than merely a filename.
+    pub match_line: i64,
+    /// How many further passages in this file matched below the window.
+    pub matches: i64,
+}
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ToolEnvelope<T> {
@@ -100,6 +138,71 @@ pub struct ToolEnvelope<T> {
     #[serde(skip)]
     #[schemars(skip)]
     pub returned_full_tokens: u64,
+    /// `QUERY_QUALITY_DESIGN` §4.2 — the distinctive vocabulary of the wider
+    /// neighbourhood around this query, when that neighbourhood is strictly
+    /// larger than what the query itself matched.
+    ///
+    /// The failure it exists for scores as a SUCCESS on every other counter:
+    /// a caller asks in the wrong register, gets ten plausible hits, concludes
+    /// the corpus is empty and leaves for the shell. The words a human wrote in
+    /// the moment are not guessable from identifiers and table names — but the
+    /// index holds them, and the caller structurally cannot compute them.
+    ///
+    /// Absent means "nothing to add": no broadened form exists, or the wider
+    /// neighbourhood is no bigger than what was already reached. It is never a
+    /// judgement about whether the results were any good.
+    ///
+    /// ⚠️ `#[serde(default)]` is load-bearing for the same reason it is on
+    /// `query_broadened` — `schemars` derives `required` from the Rust type, so
+    /// without it every response that omits this field violates its own
+    /// `outputSchema`. Gated by `envelope_emits_every_field_its_schema_requires`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neighbourhood_terms: Vec<String>,
+    /// `QUERY_QUALITY_DESIGN` §4.1, as FACTS rather than a verdict.
+    ///
+    /// bm25 ranks are not interpretable across corpora or query shapes without a
+    /// baseline the caller does not have, so the response has always carried the
+    /// makings of this signal and said nothing. What is returned here is
+    /// arithmetic over numbers already computed — never a `strong`/`weak`
+    /// judgement, because §4.1's own warning is that a mis-calibrated advisory
+    /// teaches callers to ignore the field, and that is harder to undo than
+    /// adding one late.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_shape: Option<RetrievalShape>,
+    /// Files that matched BELOW the rendered window, deduped, pointers only.
+    ///
+    /// nibdex scans to `DEEP_SCAN_DEPTH` and renders `limit`. Everything between the
+    /// two comes back as a jump target instead of silence, because the measured
+    /// failure is not that the index lacked the answer — it is that the answer sat
+    /// at rank 19 and the caller was shown ten.
+    ///
+    /// `#[serde(default)]` for the same reason `query_broadened` carries it: schemars
+    /// derives `required` from the Rust type, so a bare `Vec` would be advertised
+    /// mandatory and then dropped by `skip_serializing_if` whenever nothing matched
+    /// below the window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_matched: Vec<AlsoMatched>,
+}
+
+/// Facts about how this query landed. All three are already known at response
+/// time; none required a threshold to produce.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct RetrievalShape {
+    /// bm25 of the best hit. More negative is better.
+    pub top_rank: f64,
+    /// `worst_returned - top_rank`, i.e. how far the returned set spreads.
+    ///
+    /// A set clustered hard at the top and a flat set are the two shapes §4.1
+    /// observed, and they are the difference between "this corpus has an answer"
+    /// and "nothing here is much better than anything else". The number is given;
+    /// the reading is the caller's.
+    pub rank_spread: f64,
+    /// How many sections an OR-broadened form of the same query reaches.
+    ///
+    /// Larger than `total_matched` means the query is narrower than the corpus
+    /// region it is aimed at — which is the signature of a vocabulary miss and is
+    /// exactly when `neighbourhood_terms` is populated.
+    pub neighbourhood_matched: i64,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -224,6 +327,21 @@ pub struct CommitResult {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MemoryResult {
+    /// Absolute path of the file this entry came from.
+    ///
+    /// Every other corpus returns its hit's location; this one did not, and the
+    /// consequence was worse than not being able to open a result. A memory
+    /// directory can hold subdirectories — `_archive/` for retired entries is a
+    /// real convention — and nothing in `name`, `memory_type`, `description` or the
+    /// frontmatter distinguishes a retired entry from a live one. Without the path,
+    /// superseded guidance competed with current guidance and the caller had no way
+    /// to tell: measured on a real corpus, a query about a since-replaced vendor
+    /// returned two archived entries ranked ABOVE the live entry recording the
+    /// replacement.
+    ///
+    /// `documents.path` held this the whole time — the query simply never joined
+    /// through to it. gnuphie-labs#21.
+    pub path: String,
     pub name: String,
     pub memory_type: String,
     pub description: Option<String>,
@@ -243,7 +361,10 @@ pub struct DesignDocResult {
     /// window comes back with `body_truncated: true` — use `doc_path` +
     /// `line_start`/`line_end` to read it in full.
     pub body: String,
-    /// First 200 chars of body, word-boundary truncated.
+    /// First 200 chars of body, word-boundary truncated — carried ONLY when the budget
+    /// dropped `body` to empty, since a present body already opens with these same
+    /// characters. Omitted from the payload otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body_excerpt: String,
     /// True when `body` was capped or omitted by the D-10.11 budget (full text lives at
     /// `doc_path` lines `line_start`..=`line_end`).
@@ -280,7 +401,10 @@ pub struct CodeResult {
     /// the window comes back with `body_truncated: true` — use `repo_path` + `path` +
     /// `line_start`/`line_end` to read it in full.
     pub body: String,
-    /// First 200 chars of body, word-boundary truncated.
+    /// First 200 chars of body, word-boundary truncated — carried ONLY when the budget
+    /// dropped `body` to empty, since a present body already opens with these same
+    /// characters. Omitted from the payload otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body_excerpt: String,
     /// True when `body` was capped or omitted by the budget (full text lives at
     /// `path` lines `line_start`..=`line_end`).
@@ -447,6 +571,27 @@ pub struct IndexerCounts {
     pub search_index_total: i64,
 }
 
+impl IndexerCounts {
+    /// True when every corpus is empty — nothing has ever been indexed here.
+    ///
+    /// Exists because `serve` runs the watcher only and performs no initial
+    /// scan (D-6.2): a daemon pointed at a fresh database stays empty until
+    /// something changes on disk. Without an explicit signal, that state is
+    /// all-zero counts behind a 200, which is indistinguishable from a
+    /// workspace that genuinely has nothing in it. gnuphie-labs/nibdex#15.
+    pub fn is_empty(&self) -> bool {
+        self.documents.values().all(|&n| n == 0)
+            && self.session_entries == 0
+            && self.session_edges == 0
+            && self.memory_entries == 0
+            && self.design_doc_sections == 0
+            && self.source_chunks == 0
+            && self.commit_entries == 0
+            && self.indexed_repos == 0
+            && self.search_index_total == 0
+    }
+}
+
 /// Orphan counts. All zero at commit 2 (computation lands commit 3 per D-6.3.1).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct OrphanCounts {
@@ -585,5 +730,57 @@ impl Stages {
             "join": self.join_ms,
             "shape_response": self.shape_response_ms,
         })
+    }
+}
+
+#[cfg(test)]
+mod index_empty_tests {
+    use super::*;
+
+    fn zeroed() -> IndexerCounts {
+        IndexerCounts {
+            documents: BTreeMap::new(),
+            session_entries: 0,
+            session_edges: 0,
+            memory_entries: 0,
+            design_doc_sections: 0,
+            source_chunks: 0,
+            commit_entries: 0,
+            indexed_repos: 0,
+            search_index_total: 0,
+        }
+    }
+
+    /// The state `serve` leaves behind on a fresh database: nothing indexed,
+    /// and nothing on disk changing to trigger the watcher. gnuphie-labs/nibdex#15.
+    #[test]
+    fn a_freshly_created_index_reports_empty() {
+        assert!(zeroed().is_empty());
+    }
+
+    /// One row in any corpus is enough to stop calling it empty — the warning
+    /// must not keep firing at a workspace that is merely small.
+    #[test]
+    fn any_single_populated_corpus_is_not_empty() {
+        let mut c = zeroed();
+        c.commit_entries = 1;
+        assert!(!c.is_empty(), "one commit is not an empty index");
+
+        let mut c = zeroed();
+        c.memory_entries = 1;
+        assert!(!c.is_empty(), "one memory entry is not an empty index");
+
+        let mut c = zeroed();
+        c.documents.insert("source".to_string(), 1);
+        assert!(!c.is_empty(), "one document is not an empty index");
+    }
+
+    /// A `documents` map that exists but sums to zero is still empty — the
+    /// GROUP BY can yield a key with no rows behind it.
+    #[test]
+    fn a_documents_map_of_zeroes_is_still_empty() {
+        let mut c = zeroed();
+        c.documents.insert("source".to_string(), 0);
+        assert!(c.is_empty());
     }
 }

@@ -5,6 +5,7 @@
 //! helpers. Exposed for unit tests without the rmcp transport. Relocated
 //! from `mcp.rs` by gh#6 (see `docs/MCP_SPLIT_PLAN.md`).
 
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -17,13 +18,51 @@ use super::format::{
 use super::fts5::{
     fts5_or_broadened, like_substring, match_count_with_or_fallback, sanitize_fts5_query,
 };
+use super::neighbourhood::{neighbourhood_terms, rank_span};
 use super::types::{
-    CodeResult, CommitResult, Corpus, DEFAULT_DAYS, DEFAULT_LIMIT, DESIGN_DOC_BODY_CHAR_LIMIT,
+    AlsoMatched, CodeResult, CommitResult, Corpus, DEEP_SCAN_DEPTH, DEFAULT_DAYS, DEFAULT_LIMIT, DESIGN_DOC_BODY_CHAR_LIMIT,
     DESIGN_DOC_TOTAL_BODY_BUDGET, DesignDocResult, FindCodeRequest, FindCommitRequest,
     FindDesignDocRequest, FindMemoryRequest, FindSessionRequest, MAX_LIMIT, MemoryResult,
-    RecentCommitsRequest, RecentSessionsRequest, SOURCE_BODY_CHAR_LIMIT, SOURCE_TOTAL_BODY_BUDGET,
+    RecentCommitsRequest, RecentSessionsRequest, RetrievalShape, SOURCE_BODY_CHAR_LIMIT,
+    SOURCE_TOTAL_BODY_BUDGET,
     SUMMARY_CHAR_LIMIT, SessionEdgeResult, Stages, ToolEnvelope,
 };
+
+/// Collapse the below-the-window rows into one pointer per FILE, rank order preserved.
+///
+/// Rank order is the input order, so the first time a path appears is its best hit and
+/// that is the line worth jumping to. Later appearances only increment the count.
+///
+/// A file already rendered in the head is skipped entirely: the caller has its body, so
+/// repeating it as a pointer spends bytes to say something they can already see. That
+/// dedupe is the whole reason this is affordable — ranks 11..40 are frequently several
+/// chunks of the same document.
+pub(super) fn build_also_matched(
+    head_paths: &HashSet<String>,
+    tail: impl IntoIterator<Item = (String, i64)>,
+) -> Vec<AlsoMatched> {
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: HashMap<String, (i64, i64)> = HashMap::new();
+    for (path, match_line) in tail {
+        if head_paths.contains(&path) {
+            continue;
+        }
+        match seen.get_mut(&path) {
+            Some(entry) => entry.1 += 1,
+            None => {
+                seen.insert(path.clone(), (match_line, 1));
+                order.push(path);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|path| {
+            let (match_line, matches) = seen[&path];
+            AlsoMatched { path, match_line, matches }
+        })
+        .collect()
+}
 
 pub async fn run_recent_sessions(
     pool: &SqlitePool,
@@ -526,12 +565,17 @@ pub async fn run_find_memory(
         match_count_with_or_fallback(pool, COUNT_SQL, query, &sanitized).await?;
     stages.fts5_query_ms = t0.elapsed().as_millis() as u64;
 
-    type Row = (String, String, Option<String>, String, f64);
+    type Row = (String, String, String, Option<String>, String, f64);
     let t1 = Instant::now();
+    // The JOIN to `documents` is the whole of gnuphie-labs#21: every other corpus
+    // already does it, and this one did not, so the memory corpus behaved as a flat
+    // namespace keyed on `name` while storage knew the real location all along.
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT m.name, m.memory_type, m.description, m.body, bm25(search_index) AS rank \
+        "SELECT d.path, m.name, m.memory_type, m.description, m.body, \
+                bm25(search_index) AS rank \
          FROM search_index s \
          JOIN memory_entries m ON m.id = s.rowid_ref AND s.source_table = 'memory_entries' \
+         JOIN documents d ON d.id = m.document_id \
          WHERE s.body MATCH ? \
          ORDER BY rank ASC, m.name \
          LIMIT ?",
@@ -546,7 +590,8 @@ pub async fn run_find_memory(
     let results: Vec<MemoryResult> = rows
         .into_iter()
         .map(
-            |(name, memory_type, description, body, rank)| MemoryResult {
+            |(path, name, memory_type, description, body, rank)| MemoryResult {
+                path,
                 name,
                 memory_type,
                 description,
@@ -560,6 +605,26 @@ pub async fn run_find_memory(
     // Memory bodies are returned untrimmed → the result body is the full read size.
     let returned_full_tokens =
         (results.iter().map(|r| r.body.chars().count()).sum::<usize>() / 4) as u64;
+    // QUERY_QUALITY_DESIGN §4.1/§4.2. Both are advisory: a failure to produce them
+    // must never fail a retrieval that otherwise worked, so the error is swallowed
+    // and the fields simply stay absent.
+    const BODY_SQL: &str = "SELECT m.body \
+         FROM search_index s \
+         JOIN memory_entries m ON m.id = s.rowid_ref AND s.source_table = 'memory_entries' \
+         WHERE s.body MATCH ? \
+         ORDER BY bm25(search_index) ASC \
+         LIMIT ?";
+    let (neighbourhood_terms, neighbourhood_matched) =
+        neighbourhood_terms(pool, BODY_SQL, COUNT_SQL, query, &sanitized, total)
+            .await
+            .unwrap_or_else(|_| (Vec::new(), total));
+    let retrieval_shape = rank_span(results.iter().filter_map(|r| r.rank)).map(|(top, spread)| {
+        RetrievalShape {
+            top_rank: top,
+            rank_spread: spread,
+            neighbourhood_matched,
+        }
+    });
     let mut envelope = ToolEnvelope {
         results,
         total_matched: total,
@@ -569,6 +634,9 @@ pub async fn run_find_memory(
         corpus_empty: None,
         corpus_indexed_through: None,
         returned_full_tokens,
+        neighbourhood_terms,
+        retrieval_shape,
+        also_matched: Vec::new(),
     };
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
     annotate_empty_result(&mut envelope, pool, Corpus::MemoryEntries).await;
@@ -628,19 +696,26 @@ pub async fn run_find_design_doc(
          )",
     )
     .bind(&match_query)
-    .bind(limit)
+    // Scan deeper than we render. The extra rows cost milliseconds, which §3.1 says are
+    // free here; what they buy is a pointer instead of silence for a file at rank 19.
+    // Bodies stay budgeted over the rendered head only, so this spends no body bytes.
+    .bind(limit.max(DEEP_SCAN_DEPTH))
     .fetch_all(pool)
     .await?;
     stages.join_ms = t1.elapsed().as_millis() as u64;
 
     let t2 = Instant::now();
+    let mut rows = rows;
+    let tail_rows = rows.split_off((limit as usize).min(rows.len()));
     // D-10.11/D-10.16: the snippet is already match-centered and short, but we still
     // bound each body to `DESIGN_DOC_BODY_CHAR_LIMIT` and enforce a total-payload
     // budget as a backstop (the original ~246 KB blow-up was many fat sections at
     // once). Truncation is never silent: a bounded/dropped body sets `body_truncated`,
     // and `doc_path` + the `line_start`/`line_end` range let the caller Read the full
-    // section. The excerpt is the head of the snippet, so it is match-relevant too and
-    // stays present even when the body is budget-dropped.
+    // section. The excerpt is the head of the snippet, so it is match-relevant too — and
+    // it is carried ONLY when the body was budget-dropped, since a present body already
+    // opens with those same characters. Emitting both spends `SUMMARY_CHAR_LIMIT` chars
+    // per hit to say what the body already said.
     let mut spent_chars = 0usize;
     // Grounded-counterfactual raw input: sum the FULL section length (pre-trim) of
     // every returned hit — the by-hand read size before nibdex's snippet/budget cut.
@@ -660,12 +735,19 @@ pub async fn run_find_design_doc(
                     spent_chars += bounded.chars().count();
                     bounded
                 };
+                // Redundant beside a present body (it is that body's own head), so it
+                // rides along only when the body was dropped and it is all the caller gets.
+                let body_excerpt = if body_out.is_empty() {
+                    summarize(&snippet_body, SUMMARY_CHAR_LIMIT)
+                } else {
+                    String::new()
+                };
                 DesignDocResult {
                     doc_path,
                     heading_path,
                     line_start,
                     line_end,
-                    body_excerpt: summarize(&snippet_body, SUMMARY_CHAR_LIMIT),
+                    body_excerpt,
                     body_truncated: body_out.chars().count() < full_len,
                     body: body_out,
                     match_line,
@@ -677,6 +759,30 @@ pub async fn run_find_design_doc(
 
     let returned = results.len() as i64;
     let returned_full_tokens = (returned_full_chars / 4) as u64;
+    // QUERY_QUALITY_DESIGN §4.1/§4.2 — and this is the corpus the design was written
+    // FROM: the observed failure was one `find_design_doc` call in the wrong register,
+    // ten plausible hits, and a session that spent the next several hours reporting
+    // "the record does not support this" to someone who knew that it did.
+    const BODY_SQL: &str = "SELECT d.body \
+         FROM search_index s \
+         JOIN design_doc_sections d ON d.id = s.rowid_ref AND s.source_table = 'design_doc_sections' \
+         WHERE s.body MATCH ? \
+         ORDER BY bm25(search_index) ASC \
+         LIMIT ?";
+    let (neighbourhood_terms, neighbourhood_matched) =
+        neighbourhood_terms(pool, BODY_SQL, COUNT_SQL, query, &sanitized, total)
+            .await
+            .unwrap_or_else(|_| (Vec::new(), total));
+    let retrieval_shape = rank_span(results.iter().filter_map(|r| r.rank)).map(|(top, spread)| {
+        RetrievalShape {
+            top_rank: top,
+            rank_spread: spread,
+            neighbourhood_matched,
+        }
+    });
+    let head_paths: HashSet<String> = results.iter().map(|r| r.doc_path.clone()).collect();
+    let also_matched =
+        build_also_matched(&head_paths, tail_rows.into_iter().map(|r| (r.0, r.7)));
     let mut envelope = ToolEnvelope {
         results,
         total_matched: total,
@@ -686,6 +792,9 @@ pub async fn run_find_design_doc(
         corpus_empty: None,
         corpus_indexed_through: None,
         returned_full_tokens,
+        neighbourhood_terms,
+        retrieval_shape,
+        also_matched,
     };
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
     annotate_empty_result(&mut envelope, pool, Corpus::DesignDocSections).await;
@@ -808,7 +917,8 @@ pub async fn run_find_code(
     .bind(&match_query)
     .bind(repo_bind)
     .bind(repo_bind)
-    .bind(limit)
+    // Scan deeper than we render — see the design-doc path above and DEEP_SCAN_DEPTH.
+    .bind(limit.max(DEEP_SCAN_DEPTH))
     .fetch_all(pool)
     .await?;
     stages.join_ms = t1.elapsed().as_millis() as u64;
@@ -817,6 +927,8 @@ pub async fn run_find_code(
     // cap the per-call payload. Truncation is never silent — a capped body ends in `…`
     // with `body_truncated` set, and path + line range let the caller Read full text.
     let t2 = Instant::now();
+    let mut rows = rows;
+    let tail_rows = rows.split_off((limit as usize).min(rows.len()));
     let mut spent_chars = 0usize;
     // Grounded-counterfactual raw input: sum the FULL chunk length (pre-trim) of
     // every returned hit — the by-hand read size before nibdex's snippet/budget cut.
@@ -851,13 +963,20 @@ pub async fn run_find_code(
                     &doc_hash,
                     &stored,
                 );
+                // Redundant beside a present body (it is that body's own head), so it
+                // rides along only when the body was dropped and it is all the caller gets.
+                let body_excerpt = if body_out.is_empty() {
+                    summarize(&snippet_body, SUMMARY_CHAR_LIMIT)
+                } else {
+                    String::new()
+                };
                 CodeResult {
                     repo_path,
                     path,
                     line_start: loc.line_start,
                     line_end: loc.line_end,
                     language,
-                    body_excerpt: summarize(&snippet_body, SUMMARY_CHAR_LIMIT),
+                    body_excerpt,
                     body_truncated: body_out.chars().count() < full_len,
                     body: body_out,
                     match_line: loc.match_line,
@@ -873,6 +992,20 @@ pub async fn run_find_code(
 
     let returned = results.len() as i64;
     let returned_full_tokens = (returned_full_chars / 4) as u64;
+    // Anchor the tail the same way the rendered hits are anchored: `path` is
+    // repo-RELATIVE, and handing back a bare `src/main.rs` on a multi-repo index is
+    // exactly gnuphie-labs#8. Head paths are joined identically so the dedupe compares
+    // like with like.
+    let join = |repo: &Option<String>, path: &str| match repo {
+        Some(root) => format!("{}/{}", root.trim_end_matches('/'), path),
+        None => path.to_string(),
+    };
+    let head_paths: HashSet<String> =
+        results.iter().map(|r| join(&r.repo_path, &r.path)).collect();
+    let also_matched = build_also_matched(
+        &head_paths,
+        tail_rows.into_iter().map(|r| (join(&r.0, &r.1), r.10)),
+    );
     let mut envelope = ToolEnvelope {
         results,
         total_matched: total,
@@ -882,6 +1015,14 @@ pub async fn run_find_code(
         corpus_empty: None,
         corpus_indexed_through: None,
         returned_full_tokens,
+        // §4.1/§4.2 deliberately NOT wired here yet. `find_code`'s COUNT carries the
+        // repo filter's extra binds, so the single-bind helper does not fit, and
+        // `neighbourhood_matched` would have to be filled with `total` — which reads
+        // as "there is no wider neighbourhood" when what is true is "nobody looked".
+        // An unverified fact is worse than an absent one. Follow-up, not oversight.
+        neighbourhood_terms: Vec::new(),
+        retrieval_shape: None,
+        also_matched,
     };
     stages.shape_response_ms = t2.elapsed().as_millis() as u64;
     annotate_empty_result(&mut envelope, pool, Corpus::SourceChunks).await;

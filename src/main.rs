@@ -510,6 +510,26 @@ async fn main() -> Result<()> {
                 );
             }
             let pool = db::open(&db).await?;
+            // `serve` runs the watcher only — it performs no initial scan
+            // (D-6.2), so a fresh database stays empty until something changes
+            // on disk. An empty index answers every query with nothing while
+            // /healthz still returns 200, so the silence reads as health. Say
+            // it out loud at startup. gnuphie-labs/nibdex#15.
+            match mcp::compute_indexer_counts(&pool).await {
+                Ok(counts) if counts.is_empty() => eprintln!(
+                    "[nibdex serve] WARNING: the index at {} is EMPTY, and `serve` \
+                     does not backfill it — the watcher only reacts to changes. \
+                     Queries and the PreToolUse hook return nothing until you run:\n    \
+                     nibdex index --workspace {} --db {}",
+                    db.display(),
+                    workspace.display(),
+                    db.display(),
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[nibdex serve] warning: could not read index counts: {e}")
+                }
+            }
             reconcile_cost_ledger(&pool, &metrics_sink).await;
             let sink = resolve_metrics_sink(metrics_sink)?;
             let calibration = resolve_calibration(&calibration_toml);

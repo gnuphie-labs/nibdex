@@ -100,12 +100,13 @@ pub fn extract_session_numbers(content: &str) -> Vec<i64> {
 /// - `## Recent session history` heading present → "heading found but no
 ///   `- **#N**:` bullets matched" (probable: bullet shape differs).
 /// - No exact heading, but other session-flavored headings present → lists them
-///   up to three (probable: different convention; LIMITATIONS §6.1).
+///   up to three (probable: different convention; LIMITATIONS "The session
+///   corpus is transcript-derived").
 /// - Neither → "looks like a static project README, not a session log" (no
 ///   action needed).
 pub fn diagnose_empty_extraction(content: &str) -> String {
     if SECTION_HEADING.find(content).is_some() {
-        return "found '## Recent session history' heading but no `- **#N**:` bullets matched — entry shape may differ (see docs/LIMITATIONS.md §6.1)".to_string();
+        return "found '## Recent session history' heading but no `- **#N**:` bullets matched — entry shape may differ (see LIMITATIONS \"The session corpus is transcript-derived\")".to_string();
     }
     let session_like: Vec<String> = SESSION_LIKE_HEADING
         .find_iter(content)
@@ -116,7 +117,7 @@ pub fn diagnose_empty_extraction(content: &str) -> String {
         "no '## Recent session history' heading and no other session-flavored headings — likely a static project README, not a session log".to_string()
     } else {
         format!(
-            "no '## Recent session history' heading; found other session-flavored heading(s) [{}] — likely a different convention (see docs/LIMITATIONS.md §6.1)",
+            "no '## Recent session history' heading; found other session-flavored heading(s) [{}] — likely a different convention (see LIMITATIONS \"The session corpus is transcript-derived\")",
             session_like.join(" | ")
         )
     }

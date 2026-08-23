@@ -2,7 +2,342 @@
 
 Notable changes per release. Versioning policy: [`docs/VERSIONING.md`](docs/VERSIONING.md).
 
-## 0.2.0-rc.3 — the hook becomes the front door; a schema corpus (unreleased)
+## 0.2.0-rc.4 — an empty index announces itself; a miss can come back as a pointer; a response can hand back vocabulary (2026-08-23)
+
+Seven changes, four of them fixes for issues filed against rc.3.
+
+**This is alpha software, and "rc" overstates it.** The identifier is a sequence
+token kept for version-ordering reasons ([`docs/VERSIONING.md`](docs/VERSIONING.md)),
+not a claim that this could ship as final. Preparing this release turned up a wire
+field missing from its own notes and a release gate that had been validating an
+already-published version — the kind of thing a beta should not still be finding.
+
+Two are worth reading before the rest. The vocabulary feature is new enough that
+its caveats matter more than its description, and it is disclosed that way. And
+`body_excerpt` is the **one change here that alters an existing output shape** — it
+is no longer emitted beside a body that already contains it. An index built by rc.3
+keeps working untouched; a consumer that reads `body_excerpt` unconditionally does
+not. See **Upgrading** for the whole picture in one place.
+
+**And one thing this release deliberately does not fix.** Several changes here make
+nibdex *find* more; none makes it *rank* better, and ranking is the weaker half by a
+clear margin. That is stated in full below under **The known limitation this release
+does not fix, and is not waiting for** — read it before deciding whether the tool
+earns a place in your workflow.
+
+### An empty index is a state, not silence
+
+`serve` does not index — that split is deliberate and unchanged — but a database
+that had never been indexed came back from a restart with `/healthz` answering
+`200`, every corpus at `0`, and no indication anywhere that anything was wrong.
+Only a manual poll caught it.
+
+rc.3 made `nibdex hook` the front door, which raises the stakes: the hook fails
+open silently when it finds no index, so the primary path degrades to returning
+nothing with no signal at either end. A tool that quietly stops helping is worse
+than one that fails, because nobody goes looking.
+
+`/healthz` now carries `index_empty`, so a probe can tell *never indexed* from
+*indexed and quiet* without knowing the corpus schema, and startup prints a
+warning naming the database path and the exact command that repairs it.
+
+**The honest limit:** that warning goes to stderr, which under a service manager
+lands in a log file nothing reads. This was confirmed in the field within hours
+of the fix — a daemon was SIGKILLed and its log went on displaying the previous
+run's cheerful "watching" lines while the service was gone. **The `/healthz`
+field is the robust half.** Making the empty state *unmissable* rather than
+merely discoverable needs a surface this release does not add.
+
+### `find_memory` and `find_design_doc` can hand back the corpus's own vocabulary
+
+The failure this addresses is not a retrieval failure, and it scores as a success
+on every counter nibdex keeps: a caller invokes the right tool, asks one
+badly-worded question, receives ten plausible hits, concludes the corpus does not
+contain the material, and leaves for `grep`. Ten results came back. Nothing was
+broken. The words simply were not the ones the documents were written in.
+
+Documents are written in the register of a person and an occasion. Identifiers,
+table names and codes are vocabulary imposed later, by the reader. A caller
+cannot guess the first from the second — but the index holds both.
+
+Two additive fields:
+
+- **`neighbourhood_terms`** — up to eight distinctive terms of the wider region
+  around the query, scored by term frequency against corpus-wide document
+  frequency. They are drawn from an OR-broadened form of the query, never from
+  the hits it already returned: terms taken from your own hits reinforce the
+  neighbourhood you already reached, and the value is in the region you missed.
+  Emitted only when that broadened neighbourhood is **strictly larger** than what
+  the query matched — a fact about the retrieval (*there is more here than you
+  reached*), not a judgement about whether the results were any good.
+- **`retrieval_shape`** — `top_rank`, `rank_spread` and `neighbourhood_matched`.
+  bm25 ranks are not interpretable across corpora or query shapes without a
+  baseline the caller does not have, and the response has always carried the
+  makings of this signal while saying nothing about it.
+
+**A `strong | mixed | weak` verdict was deliberately not built.** It needs a
+per-corpus percentile baseline, and a mis-calibrated advisory is worse than no
+advisory — it teaches callers to ignore the field, which is much harder to undo
+than adding one later.
+
+#### What is wrong with it, stated up front
+
+**It is days old.** This is a release candidate in the honest sense: the feature
+has had a fraction of the use the rest of the tool has had, and it is being
+published early on purpose, because whether it helps anyone other than its author
+is not something more time on one machine can answer.
+
+**Known weakness — corpus-local boilerplate survives.** Document frequency is
+computed over the whole index, so a term that is ubiquitous *inside one corpus*
+but unremarkable across all of them keeps a high score. On a corpus of
+template-shaped files — every file carrying the same headings — the top
+"distinctive" terms came back as the template's own words. A local ceiling (a
+term appearing in more than 60% of the sampled sections is treated as structure,
+not register) removes the worst of it and is what ships. **It does not fully fix
+it.** The real answer is a corpus-scoped background sample, so the score becomes
+contrastive — frequent *here* relative to this corpus generally — and that is not
+built. It was left unbuilt deliberately: the ceiling was already one adjustment
+made against a handful of probes, and a second would be tuning on known
+positives, which measures the base rate rather than the signal.
+
+**`find_code` does not have it.** Its count query carries a repo filter with
+extra bindings that the current helper does not fit. Filling the field with the
+unbroadened total would have stated a fact nobody checked, and an unverified fact
+is worse than an absent one.
+
+**It costs bytes.** A handful of words and three numbers, once per response, not
+per hit — but caller-side bytes are the scarce resource here, and this spends
+some of them on a field whose value is unproven.
+
+### Results stop paying twice for their own opening line
+
+`find_design_doc` and `find_code` shipped both a `body` and a `body_excerpt` —
+the first 200 characters of that same body, word-boundary truncated. Where the
+body was present, the excerpt was a strict prefix of text the caller already had.
+
+Measured on 273 real calls in this workspace's own metrics stream, that
+duplication is the single largest removable share of a response payload:
+
+| tool | calls | median payload | excerpt share |
+|---|---|---|---|
+| `find_design_doc` | 121 | 1,199 tokens | **20.9%** |
+| `find_code` | 152 | 2,190 tokens | **18.3%** |
+
+The excerpt is now emitted **only when the total-body budget dropped `body` to
+empty** — the case where it is not a duplicate but the sole content the hit
+carries, alongside `body_truncated: true` and the line range needed to read the
+rest. Present body, no excerpt; dropped body, excerpt.
+
+**This is the one output-shape change in this release.** A consumer that reads
+`body_excerpt` unconditionally now sees an absent field on most hits and must
+fall back to `body`. The field is omitted rather than emitted empty.
+
+**The near-miss worth recording:** the change was first scoped as "drop
+`body_excerpt`, it is a strict prefix of `body`, so no information is lost." That
+is true exactly while a body is present, and false for the budget-dropped tail,
+where removing it would have returned hits carrying a heading and a line number
+and no content at all. A test asserting `"a dropped body still carries an
+orienting excerpt"` is what caught it. The test now pins **both** halves — a
+dropped body keeps its excerpt, a present body must not ship one — because
+asserting only the first half would let the unconditional excerpt back in without
+failing anything.
+
+### Scan deeper than you render — a miss can now come back as a pointer
+
+The measurement that drove this is the uncomfortable one: on a labelled set of real
+searches, **52 of 53 single-term misses used words the index already held**. Callers
+were not asking in the wrong register. The right document existed, used their words,
+and sat below the window.
+
+Widening the window confirms it and isolates where the problem is not:
+
+| window | found | hit@1 | hit@3 |
+|---|---|---|---|
+| 10 | 39.3% | 14.9% | 25.6% |
+| 25 | 45.8% | 14.9% | 25.6% |
+| 50 | 48.2% | 14.9% | 25.6% |
+
+So nibdex now scans to a fixed depth of 40 and renders `limit`. Everything between
+comes back as **`also_matched`** — one pointer per *file*, deduped, carrying the best
+matching line and a count, never a body.
+
+- of the misses, the tail points at **14.7%** of them
+- **answered somehow — body or pointer — is 48.2%, up from 39.3%**
+- that is exactly the limit-50 recall at the byte cost of rendering 10
+
+**A pointer is weaker than a body and is counted separately.** It is never folded into
+`hit@k`; the headline retrieval numbers are unchanged and are meant to be.
+
+**Byte accounting, driven on the real binary rather than reasoned about:**
+`find_design_doc("hysteresis")` renders 10 bodies (4,064 chars) and 6 tail pointers
+(~715 chars) — the tail is **15% of payload**, against the **~21%** freed in the same
+release by dropping the redundant `body_excerpt`. Responses are still net smaller.
+Dedupe-by-file is what makes that true: ranks 11–40 are frequently several chunks of
+one document.
+
+**A predictor was tried first and there isn't one — recorded so nobody rebuilds it.**
+bm25 spread runs 2.916 on misses against 4.075 on hits, window saturation 76% against
+67%: both directional, both overlapping far too heavily to gate on. No predictor is
+needed, because the costs are asymmetric — query latency is nearly free and caller
+bytes are not. So never decide *whether* to look deeper. Always look, and control cost
+at the rendering end.
+
+**What this does not fix, stated plainly:** the head of the ranking. `hit@1` is 14.9%
+against a plain shell search's 28%, and it did not move at any window depth. Every
+gain here is in the tail. That remains the open problem, and it is the one a caller
+notices first.
+
+### `find-code --format grep` now emits a path you can actually use
+
+The CLI printed hits as `src/source_index.rs:1203:…` — repo-relative, with no repo.
+On a multi-repo index several repos have a `src/main.rs`, so that string resolves
+correctly only if the reader happens to be in the right directory, and resolves to
+the *wrong file* rather than to nothing if they are in a different one.
+
+`CodeHit` already carried `repo_path`, and its own doc comment called it "the half
+that makes a hit openable". The formatter simply never used it. Hits are now anchored
+to an absolute path; a quickfix `%f` takes one happily, and an absolute path cannot
+resolve against the wrong repo. Where the repo root is genuinely unknown the bare
+relative path is still emitted, because a guess would be worse than an honest partial.
+
+Closes [gnuphie-labs#8](https://github.com/gnuphie-labs/nibdex/issues/8). The MCP
+surface was already correct (`repo_path` + `path` as separate fields) — this was the
+un-migrated CLI half, and the same defect cost a working session once already, when a
+replay harness compared these relative paths against absolute ones and scored 0.000
+on 150 of 150.
+
+### `find_memory` results now say where they came from
+
+Every other corpus returns its hit's location. `find_memory` did not — and the
+consequence was worse than not being able to open a result.
+
+A memory directory can hold subdirectories, and `_archive/` for retired entries is a
+real convention. Nothing in `name`, `memory_type`, `description` or the frontmatter
+distinguishes a retired entry from a live one, so without a path they were the same
+object to a caller. Measured on a real corpus: a query about a since-replaced
+authentication vendor returned two archived entries about that vendor **ranked above
+the live entry recording that it had been replaced**. Superseded guidance competed
+with current guidance, silently.
+
+`documents.path` held the location the whole time. `run_find_memory` joined
+`search_index → memory_entries` and stopped; `find_design_doc` and `find_code` both
+join `documents` and return the path. So the memory corpus behaved as a flat
+namespace keyed on `name` — an impression `UNIQUE(name)` on `memory_entries`
+reinforces — while storage knew better.
+
+The fix is that join plus a `path` field on `MemoryResult`. Closes the reported half
+of [gnuphie-labs#21](https://github.com/gnuphie-labs/nibdex/issues/21); the other
+half, addressing named `##` sub-sections *inside* a memory file, is still open.
+
+**Additive:** callers that ignore `path` see no change.
+
+### A warning cited a documentation section that does not exist
+
+The retired `session_entries` extractor warns about entry shape and pointed at a
+`LIMITATIONS.md` section number that was never there. It now cites the section by
+name. Minor, but a diagnostic that names a nonexistent reference costs the reader
+more than silence would.
+
+### The known limitation this release does not fix, and is not waiting for
+
+Three of the seven changes above make nibdex find more. **None of them makes it rank
+better, and ranking is the part a caller notices first.**
+
+Measured against a labelled set of real searches, nibdex places the file the session
+actually opened at rank 1 **14.9%** of the time and in the top three **25.6%** of the
+time. A plain shell search over the same material manages roughly 28% and 52%. The
+comparison is not clean — different denominators, different query populations, and
+the labelled set is the author's own sessions rather than anything a reader can
+reproduce — so read it as a direction rather than a benchmark. What can be said
+flatly is that **nothing measured shows nibdex winning here.**
+
+The deep-scan tail in this release raises how often the target is found *anywhere*
+from 39.3% to 48.2%. It moves `hit@1` and `hit@3` by exactly nothing, at any depth
+tried. That is not a disappointing result, it is a structural one: depth and ranking
+are separate problems, and this release solved the one that was tractable.
+
+**This is disclosed rather than deferred because the alternative was to keep not
+shipping.** The work that makes ranking addressable — a replayable labelled set and a
+scoring harness, so a change can be scored instead of argued about — landed days ago
+and did not exist before. Ranking is the next lane, and it is being worked on. If you
+are evaluating nibdex, `docs/LIMITATIONS.md` §2.y states the same thing with the full
+numbers and the caveats, and tells you which questions the tool is currently good at.
+
+### Upgrading from 0.2.0-rc.3
+
+One migration is added, and it runs automatically at startup. **No reindex is
+needed:** it creates an `fts5vocab` virtual table over the existing search index —
+a view, not storage, always exactly as current as the index it reads. No new
+column, so the additive-column wipe-reindex rule does not apply.
+
+**Your index needs nothing.** No reindex, no rebuild, no wipe. Migrations are
+compiled into the binary and run on every database open, so an index built by rc.3
+is picked up as-is.
+
+#### The steps
+
+1. **Install.** `cargo install nibdex --version 0.2.0-rc.4`, or rebuild your
+   checkout.
+2. **Restart the daemon**, if you run one. On macOS use `launchctl bootout` then
+   `bootstrap` — **`kickstart` does not pick up a replaced binary** and will leave
+   you running the old build while reporting success (issue #5).
+3. **Restart your MCP client.** A stdio session holds the binary image it started
+   with, so an upgraded binary does not reach a session that is already open. This
+   is the step people miss.
+4. **Verify it took.** `check()` reports the `git_sha` of the build that is
+   *running*; `nibdex version` reports what is on disk. If those disagree, step 2
+   or step 3 did not happen. Checking both is the point — either one alone looks
+   fine.
+
+#### What changed in the response shape
+
+Four new fields, three of them additive and omitted when they have nothing to say,
+so a caller that ignores them sees no change:
+
+| Field | On | Notes |
+|---|---|---|
+| `neighbourhood_terms` | `find_memory`, `find_design_doc` | omitted unless the broadened neighbourhood is larger |
+| `retrieval_shape` | `find_memory`, `find_design_doc` | omitted with the above |
+| `also_matched` | queries with a deep-scan tail | omitted when empty |
+| `path` | `find_memory` hits | always present; new, not replacing anything |
+
+**`body_excerpt` is the one that needs a caller-side change.** It is now absent
+whenever `body` is populated. Read `body` first and treat `body_excerpt` as the
+fallback for hits where `body` is empty and `body_truncated` is true. If you parse
+responses programmatically and read `body_excerpt` unconditionally, this is the
+only line in the release that will bite you.
+
+#### Two notes on the mechanics
+
+- **Building from a local checkout:** `cargo`'s fingerprint does not track
+  `migrations/`. If a future release changes only that directory,
+  `cargo install --path . --force` can report success without recompiling, leaving
+  a binary that does not know about a migration already applied to the database.
+  Touch any `.rs` file first. (Not a hazard for this release — source changed too,
+  and an install from crates.io compiles fresh regardless.)
+- **Downgrading is not a supported path** at this stage of the project, and is not
+  tested. The index is a derived cache — if anything about a build looks wrong, the
+  supported recovery is to delete the database and re-index rather than to go
+  backwards.
+
+### What we would like to hear
+
+The vocabulary feature is the first thing in nibdex shipped without knowing
+whether it helps. If you try it:
+
+- Did the returned terms lead you to something the original query missed, or were
+  they noise?
+- Did they come back as your corpus's boilerplate rather than its register? That
+  is the known weakness above, and a second corpus exhibiting it would justify
+  building the real fix.
+- Did it fire when you did not want it, or stay quiet when you did?
+
+Issues [#17](https://github.com/gnuphie-labs/nibdex/issues/17) and
+[#18](https://github.com/gnuphie-labs/nibdex/issues/18) are the right places, and
+a report that it did not help is more useful than silence — a null result belongs
+in `LIMITATIONS.md` and will be put there.
+
+## 0.2.0-rc.3 — the hook becomes the front door; a schema corpus (2026-08-16)
 
 ### `nibdex hook` is documented as the main path, not an optional extra
 It was listed last in the README under "Optional". On the author's own machine it

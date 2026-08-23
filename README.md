@@ -1,8 +1,8 @@
 # nibdex
 
-> **An always-available MCP knowledge tool for the keystone resources every dev environment already has — source code, git history, design docs, memory, and AI session history — surfaced together and kept current, derived from the workspace rather than hand-curated.**
+> **An MCP knowledge tool for resources a dev environment already holds — source code, git history, design docs, memory, and AI session history — surfaced together on one ranking surface, derived from the workspace rather than hand-curated, and kept current by a file watcher while the daemon is running.**
 
-**Status:** pre-1.0, and honestly early. The core works end-to-end on real workspaces — six corpora indexed, seven query tools plus a [shell hook](#nibdex-hook--the-index-at-greps-price) that answers without one, every code hit carrying the git commit that last touched its file — and it's dogfooded daily on the author's own projects. It's also young: the usage numbers are small, several rough edges are written down in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), and the [roadmap](#roadmap) is still most of the story. The aim isn't to look finished — it's to be honest about where it stands and grow it into something genuinely solid, in the open.
+**Status: alpha.** Not beta — beta would mean this is ready and being double-checked, and it is not there yet. Expect to find real defects, and expect the tool surface to move. Pre-1.0, and honestly early. The core works end-to-end on real workspaces — six corpora indexed, seven query tools plus a [shell hook](#nibdex-hook--the-index-at-greps-price) that answers without one, every code hit carrying the git commit that last touched its file — and it's dogfooded daily on the author's own projects. It's also young: the usage numbers are small, several rough edges are written down in [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md), and the [roadmap](#roadmap) is still most of the story. The aim isn't to look finished — it's to be honest about where it stands and grow it into something genuinely solid, in the open.
 
 **Platform support:** macOS and Linux. nibdex uses libgit2 (no external `git` binary at runtime) and a target-native filesystem watcher (FSEvents on macOS, inotify on Linux). Windows support is **in progress** — the code is cross-platform and the build is target-gated (vendored libgit2), but it has not yet been built or run on real Windows hardware. See [`WINDOWS_BUILD.md`](WINDOWS_BUILD.md).
 
@@ -12,13 +12,13 @@
 
 A single-binary Rust MCP server that indexes **six corpora** — source code, git commits, AI session history, memory files, design docs, and database schema — into one SQLite + FTS5 surface, exposes them as **seven query tools plus `check()`** *and* a [shell hook](#nibdex-hook--the-index-at-greps-price) that answers without a tool call at all, and emits a JSONL event stream with an optional per-call cost-savings ledger. Code hits come back with the git commit that last touched their file, so retrieval carries its own provenance; on a working tree that has drifted since indexing, a hit reports whether its location is still `verified`, was `relocated` to the current line, has gone `stale`, or is `file_missing`.
 
-The differentiation claim (DESIGN §3): no existing tool surfaces **source code + git commits + session history + memory + design docs** *together* as structured records sharing one ranking surface, code and session hits anchored to a provenance commit. Per-corpus tools (`git log`, `ripgrep`, a curated-KB tool) each cover a slice; nibdex covers the cross-corpus join those tools can't reach without an AI synthesis step.
+The differentiation claim (DESIGN §3) — and it is a claim, not a survey: we are not aware of a tool that surfaces **source code + git commits + session history + memory + design docs** *together* as structured records sharing one ranking surface, with code and session hits anchored to a provenance commit. If one exists, we would rather hear about it than keep saying this. Per-corpus tools (`git log`, `ripgrep`, a curated-KB tool) each cover a slice; nibdex covers the cross-corpus join those tools can't reach without an AI synthesis step.
 
 ## First useful query in 10 minutes
 
 ```bash
 # 1. Install — from crates.io (pre-release, so the version is explicit) …
-cargo install nibdex --version 0.2.0-rc.3
+cargo install nibdex --version 0.2.0-rc.4
 #    … or from source
 git clone https://github.com/gnuphie-labs/nibdex.git nibdex && cd nibdex && cargo build --release
 #    (then use ./target/release/nibdex in place of nibdex below)

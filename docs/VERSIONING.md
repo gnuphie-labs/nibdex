@@ -52,6 +52,24 @@ settling, so it stays an `-rc`. It does change one **default**: a plain
 contract, but it is called out in [`CHANGELOG.md`](../CHANGELOG.md) and
 [`SECURITY.md`](../SECURITY.md) rather than left to be discovered.
 
+### The `-rc` identifier is a sequence token, not a claim
+
+Read literally, "release candidate" says *this could ship as final*. **That is not
+what it means here, and this project is alpha** — expect real defects and expect the
+tool surface to move.
+
+The identifier is kept for a mechanical reason rather than an editorial one. SemVer
+orders pre-release identifiers alphanumerically, so `alpha` sorts *before* `rc`:
+publishing `0.2.0-alpha.5` after `0.2.0-rc.3` would make crates.io report the older
+release as the newest, which is a worse misstatement than the one it fixes. The only
+clean way to make the string itself read `alpha` is to open a new minor line, and
+`0.3.x` is spoken for by Phase 2 in the table above — so that would trade an
+over-promise about *stability* for an over-promise about *scope*.
+
+So the string stays and the claim is withdrawn in words. Where the two disagree, the
+words are correct. This section exists because the alternative was to let a misnomer
+sit undisclosed, which the posture below is specifically against.
+
 ## Why this posture
 
 Experienced developers don't trust `1.0` / `2.0` versions on visibly-immature projects. SemVer's stability commitment at `1.0` is *binding*: every change after that must either preserve the public contract or carry a major bump. Under-promising and over-delivering is cheaper than the reverse.

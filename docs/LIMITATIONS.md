@@ -192,6 +192,82 @@ No anonymized aggregate reaches a project server. No phone-home. The JSONL sink 
 
 This is a *limitation* only in the sense that the project receives no operational visibility into real-world use. Reports from dogfooders are the only signal that drives bar-to-deviate re-examination on the items above.
 
+### 2.x `neighbourhood_terms` is weak on the memory corpus, and the cause is measured
+
+`find_*` responses can carry `neighbourhood_terms` — the distinctive vocabulary of
+the wider region around a query (`QUERY_QUALITY_DESIGN` §4.2). **It is good on the
+design-doc corpus and noticeably weaker on the memory corpus**, and that is a
+measured result rather than an expectation.
+
+Probed against nibdex's own corpus (reproducible from a clone):
+
+| Query | Terms returned |
+|---|---|
+| *search_index rowid_ref source_table* | `upsert` · `incremental` · `indexer` · `joined` · `oid` |
+| *launchd plist bootstrap* | `systemd` · `stdio` · `discovery` |
+| a query against template-shaped files | `apply` · `related` · the headings every file in that corpus carries |
+
+**The cause: IDF is computed index-wide.** `fts5vocab` counts documents across the
+whole index, so a term that is ubiquitous *inside one corpus* but unremarkable
+across all of them keeps a high IDF and wins. Memory files share a template — every
+one carries `**How to apply:**` and `Related:` — so the template's own words survive
+a corpus-blind IDF.
+
+A local ceiling (a term in more than 60% of the sampled sections is treated as
+structure, not register) removes the worst of it and is what ships. **It does not
+fully solve it**, and the real fix is a corpus-scoped background sample so the score
+becomes contrastive — *frequent HERE relative to this corpus generally* — rather
+than absolute. That is deliberately not built yet: the ceiling was already one
+adjustment made against a handful of eyeball probes, and a second would be tuning on
+known positives, which measures the base rate rather than the signal.
+
+⚠️ **Read the field accordingly:** on design docs and code-adjacent prose it is
+worth re-querying with. On memory, check the terms are not simply the format.
+
+### 2.y The head of the ranking is the weakest part of nibdex, and it has not improved
+
+This is the limitation to read before deciding whether nibdex is worth your time. It
+is stated here rather than left to be discovered because everything else in this
+document describes an edge; this one describes the main path.
+
+**nibdex is better at *is there material about this, and where* than at *give me the
+one right answer first*.** Scored against a labelled set of real searches — the file
+a session actually opened after searching, and at what rank nibdex had placed it:
+
+| | nibdex | a plain shell search |
+|---|---|---|
+| hit@1 | 14.9% | 28% |
+| hit@3 | 25.6% | 52% |
+| MRR | 0.218 | 0.395 |
+
+⚠️ **Not a clean head-to-head, and it is not presented as one:** the denominators
+differ (168 rows against 94), the two are scored over different query populations,
+and the labelled set is derived from the author's own sessions, so it is **not
+reproducible from a clone** the way the probes in §2.x are. Read it as the honest
+direction of a result, not a benchmark. What can be said without qualification is
+that **nothing measured shows nibdex winning at the head of the ranking.**
+
+**It did not move at any retrieval depth.** Widening the scan window from 10 to 25 to
+50 raised the share of searches whose target was found anywhere from 39.3% to 48.2%,
+while `hit@1` and `hit@3` stayed at 14.9% and 25.6% — identical at every depth. Depth
+and ranking are orthogonal. The deep-scan tail shipped in 0.2.0-rc.4 improves the
+first number and deliberately does not claim the second: a pointer is counted
+separately from a hit and is never folded into `hit@k`.
+
+**Why it is not fixed rather than why it is not admitted:** until 2026-08-23 there was
+no instrument that could score a ranking change, so any adjustment would have been
+argued about rather than measured — and the project's own history is that changes
+argued from plausibility went the wrong way about as often as the right one. A
+replayable labelled set and a scoring harness now exist, which makes ranking work
+tractable for the first time. **That is the next thing being worked on**, and it is
+the reason this release does not wait for it.
+
+⚠️ **Read the tool accordingly.** Ask it broad, orienting questions — *what has been
+written about X*, *where does Y get decided* — and expect to read several results.
+If you need the single authoritative hit at position one, a targeted `grep` over a
+path you already suspect is still the better instrument, and this document would
+rather say so than have you find out.
+
 ## 3. Related work / what nibdex is NOT
 
 nibdex sits adjacent to several tool classes. Knowing where it doesn't apply is part of knowing where it does.

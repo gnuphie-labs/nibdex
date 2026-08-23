@@ -78,6 +78,12 @@ pub(crate) fn finish_session_edge_envelope(
         corpus_empty: None,
         corpus_indexed_through: None,
         returned_full_tokens,
+        // Session/commit envelopes: the §4.1/§4.2 fields are corpus-vocabulary
+        // advisories and these two builders are shared by the recency tools, which
+        // did not ask a question to be weak about. Absent, not empty-by-accident.
+        neighbourhood_terms: Vec::new(),
+        retrieval_shape: None,
+        also_matched: Vec::new(),
     }
 }
 
@@ -155,6 +161,12 @@ pub(crate) fn finish_commit_envelope(
         corpus_empty: None,
         corpus_indexed_through: None,
         returned_full_tokens,
+        // Session/commit envelopes: the §4.1/§4.2 fields are corpus-vocabulary
+        // advisories and these two builders are shared by the recency tools, which
+        // did not ask a question to be weak about. Absent, not empty-by-accident.
+        neighbourhood_terms: Vec::new(),
+        retrieval_shape: None,
+        also_matched: Vec::new(),
     }
 }
 

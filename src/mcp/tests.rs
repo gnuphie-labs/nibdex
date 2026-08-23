@@ -592,6 +592,77 @@ async fn find_memory_happy_path() {
     assert_eq!(envelope.results[0].name, "feedback-hydration-audit");
     assert_eq!(envelope.results[0].memory_type, "feedback");
     assert!(envelope.results[0].description.is_some());
+    // gnuphie-labs#21: a memory hit must say WHERE it came from. Without this the
+    // corpus is a flat namespace keyed on `name`, and an entry under a subdirectory
+    // — `_archive/` for retired entries is a real convention — is indistinguishable
+    // from a live one. `documents.path` always held it; the query did not join it.
+    assert!(
+        envelope.results[0].path.ends_with(".md"),
+        "a memory hit carries its file path, got {:?}",
+        envelope.results[0].path
+    );
+}
+
+/// The consequence #21 is actually about: two entries whose `name`, `memory_type`
+/// and `description` give the caller nothing to choose between, distinguished only
+/// by the directory they live in. If the path is dropped, retired guidance and live
+/// guidance are the same object to a caller.
+#[tokio::test]
+async fn find_memory_distinguishes_an_archived_entry_by_its_path() {
+    let pool = fresh_pool().await;
+    seed_all(&pool).await;
+
+    for (path, name) in [
+        ("/ws/memory/feedback-vendor-x.md", "feedback-vendor-x"),
+        ("/ws/memory/_archive/feedback-vendor-x-old.md", "feedback-vendor-x-old"),
+    ] {
+        let doc: (i64,) = sqlx::query_as(
+            "INSERT INTO documents (path, kind, mtime, content_hash, indexed_at) \
+             VALUES (?, 'memory', 0, 'h', 0) RETURNING id",
+        )
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let entry: (i64,) = sqlx::query_as(
+            "INSERT INTO memory_entries (document_id, name, memory_type, description, body) \
+             VALUES (?, ?, 'feedback', 'vendor guidance', 'vendorx authentication guidance') \
+             RETURNING id",
+        )
+        .bind(doc.0)
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO search_index (body, source_table, rowid_ref) \
+             VALUES ('vendorx authentication guidance', 'memory_entries', ?)",
+        )
+        .bind(entry.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let envelope = run_find_memory(
+        &pool,
+        &FindMemoryRequest { query: "vendorx".into(), limit: Some(10) },
+        &mut Stages::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(envelope.results.len(), 2, "both entries match the query");
+    let archived: Vec<_> = envelope
+        .results
+        .iter()
+        .filter(|r| r.path.contains("/_archive/"))
+        .collect();
+    assert_eq!(
+        archived.len(),
+        1,
+        "the archived entry is identifiable FROM THE RESPONSE, not by opening files"
+    );
 }
 
 #[tokio::test]
@@ -653,7 +724,10 @@ async fn find_design_doc_happy_path() {
     assert_eq!(envelope.results[0].heading_path, "F45/Path Comparison");
     assert_eq!(envelope.results[0].line_start, 12);
     assert_eq!(envelope.results[0].line_end, 48);
-    assert!(!envelope.results[0].body_excerpt.is_empty());
+    // A hit whose body survived the budget carries no excerpt: the body opens with
+    // those same characters, so emitting both would pay twice to say it once.
+    assert!(!envelope.results[0].body.is_empty());
+    assert!(envelope.results[0].body_excerpt.is_empty());
 }
 
 #[tokio::test]
@@ -767,7 +841,9 @@ async fn find_code_happy_path_carries_provenance() {
     // The code↔commit provenance join rides with the hit.
     assert_eq!(hit.commit_sha.as_deref(), Some("abc123"));
     assert_eq!(hit.commit_summary.as_deref(), Some("add resolver"));
-    assert!(!hit.body_excerpt.is_empty());
+    // Body present ⇒ no excerpt (see `find_design_doc` above for the reasoning).
+    assert!(!hit.body.is_empty());
+    assert!(hit.body_excerpt.is_empty());
     // Freshness gate: the seeded documents row points at '/repo/src/resolve.rs',
     // which doesn't exist on this machine — honestly reported, not invented.
     assert_eq!(hit.location, "file_missing");
@@ -1318,6 +1394,14 @@ async fn find_design_doc_enforces_total_body_budget_across_results() {
     for r in dropped {
         assert!(r.body_truncated, "a dropped body is flagged truncated");
         assert!(!r.body_excerpt.is_empty(), "a dropped body still carries an orienting excerpt");
+    }
+    // The other half of the same contract: while the body is present the excerpt is
+    // pure duplication and must not be paid for. Asserting only the `dropped` half
+    // would let an unconditional excerpt back in without failing anything.
+    let kept: Vec<_> = envelope.results.iter().filter(|r| !r.body.is_empty()).collect();
+    assert!(!kept.is_empty(), "some hits must fit inside the budget for this to test anything");
+    for r in kept {
+        assert!(r.body_excerpt.is_empty(), "a present body must not also ship an excerpt");
     }
 }
 
@@ -2535,6 +2619,9 @@ fn envelope_emits_every_field_its_schema_requires() {
         corpus_empty: None,
         corpus_indexed_through: None,
         returned_full_tokens: 0,
+        neighbourhood_terms: Vec::new(),
+        retrieval_shape: None,
+        also_matched: Vec::new(),
     };
 
     let schema = serde_json::to_value(schemars::schema_for!(ToolEnvelope<CodeResult>)).unwrap();
@@ -3665,6 +3752,9 @@ async fn corpus_probes_read_their_own_table_and_clock() {
                 corpus_empty: None,
                 corpus_indexed_through: None,
                 returned_full_tokens: 0,
+        neighbourhood_terms: Vec::new(),
+        retrieval_shape: None,
+        also_matched: Vec::new(),
             };
             annotate_empty_result(&mut env, &pool, probe).await;
             if probe == *seeded {
@@ -3755,4 +3845,54 @@ async fn check_percentiles_honour_the_window_and_skip_errors() {
         Some(&40),
         "latest SUCCESSFUL run, not the newer errored one"
     );
+}
+
+// ---- deep-scan tail (QUERY_QUALITY_DESIGN §6d) ---------------------------------
+
+use std::collections::HashSet;
+
+/// Ranks 11..40 are frequently several chunks of the SAME file. Collapsing them is
+/// what makes the tail affordable, so this pins the collapse rather than trusting it.
+#[test]
+fn also_matched_dedupes_by_file_and_keeps_the_best_line() {
+    let head = HashSet::new();
+    let tail = vec![
+        ("/repo/src/a.rs".to_string(), 40),
+        ("/repo/src/a.rs".to_string(), 91),
+        ("/repo/src/b.rs".to_string(), 7),
+        ("/repo/src/a.rs".to_string(), 120),
+    ];
+    let out = build_also_matched(&head, tail);
+    assert_eq!(out.len(), 2, "three chunks of a.rs collapse to one pointer");
+    assert_eq!(out[0].path, "/repo/src/a.rs");
+    assert_eq!(
+        out[0].match_line, 40,
+        "rank order is input order, so the FIRST sighting is the best hit"
+    );
+    assert_eq!(out[0].matches, 3, "and it says how many passages matched");
+    assert_eq!(out[1].path, "/repo/src/b.rs");
+    assert_eq!(out[1].matches, 1);
+}
+
+/// A file whose body the caller already has must not be re-advertised as a pointer —
+/// that spends bytes to say something already on screen.
+#[test]
+fn also_matched_excludes_files_already_rendered_in_the_head() {
+    let head: HashSet<String> = ["/repo/src/a.rs".to_string()].into_iter().collect();
+    let tail = vec![
+        ("/repo/src/a.rs".to_string(), 40),
+        ("/repo/src/b.rs".to_string(), 7),
+    ];
+    let out = build_also_matched(&head, tail);
+    assert_eq!(out.len(), 1, "the head's own file is dropped from the tail");
+    assert_eq!(out[0].path, "/repo/src/b.rs");
+}
+
+/// Nothing below the window ⇒ nothing to say. Guards the `skip_serializing_if` path:
+/// an empty vec must stay empty rather than becoming a field full of noise.
+#[test]
+fn also_matched_is_empty_when_the_tail_adds_nothing() {
+    let head: HashSet<String> = ["/repo/src/a.rs".to_string()].into_iter().collect();
+    let out = build_also_matched(&head, vec![("/repo/src/a.rs".to_string(), 40)]);
+    assert!(out.is_empty());
 }

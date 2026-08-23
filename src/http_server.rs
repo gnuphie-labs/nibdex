@@ -49,6 +49,12 @@ pub struct HealthResponse {
     /// full block (with `git_describe`/`commit_time`) is in the `check()` tool.
     pub crate_version: String,
     pub git_sha: String,
+    /// True when no corpus holds a single row. `serve` performs no initial
+    /// scan, so a daemon on a fresh database stays empty until a watched file
+    /// changes; without this a probe cannot tell "never indexed" from
+    /// "indexed and quiet" — both are all-zero counts behind a 200.
+    /// gnuphie-labs/nibdex#15.
+    pub index_empty: bool,
 }
 
 #[derive(Clone)]
@@ -113,6 +119,7 @@ async fn healthz(State(state): State<HealthState>) -> impl IntoResponse {
             StatusCode::OK,
             Json(HealthResponse {
                 daemon_uptime_s: check.daemon_uptime_s,
+                index_empty: check.indexer.is_empty(),
                 indexer: check.indexer,
                 orphans: check.orphans,
                 shallow_repos: check.shallow_repos,
@@ -303,6 +310,15 @@ mod tests {
         assert_eq!(response.status(), 200);
         let payload: serde_json::Value = response.json().await?;
         assert!(payload.get("indexer").is_some());
+        // `fresh_pool` is an empty database, which is exactly the state a
+        // `serve` on a new workspace leaves behind. The probe must be able to
+        // SEE that, not just report 200 over all-zero counts.
+        // gnuphie-labs/nibdex#15.
+        assert_eq!(
+            payload.get("index_empty").and_then(|v| v.as_bool()),
+            Some(true),
+            "an empty index must be visible on /healthz, got: {payload}"
+        );
 
         // Trigger graceful shutdown and confirm the server exits within the
         // drain window. 2s ceiling — axum's graceful shutdown waits for

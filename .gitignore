@@ -58,3 +58,9 @@ id_ed25519
 
 # Day 10 self-dogfood — local metrics-export candidates (IP-scrubbed, hand-shared; not tracked)
 dogfood/nibdex-metrics-export-*.json
+
+# read-rank labelled sets. Real corpus paths and real queries — generated,
+# machine-local, and never published. This repo is cut to a public tree, so an
+# untracked-and-unignored file here is one `git add -A` from travelling.
+dogfood/labelled-read-rank-*.json
+__pycache__/

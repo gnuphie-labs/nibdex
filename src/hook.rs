@@ -6,7 +6,7 @@
 //!
 //! nibdex's MCP tools are **deferred** by the host: reaching one costs a
 //! `ToolSearch` before the call, which `grep` never pays. Measured across 110
-//! sessions on an 18-repo corpus, all 53 that used nibdex fetched its schemas
+//! sessions on a large workspace, all 53 that used nibdex fetched its schemas
 //! first. The obvious remedy is dead — a 2-tool server in an otherwise empty
 //! workspace is deferred too, so shrinking the tool surface cannot win residency.
 //!
@@ -563,7 +563,7 @@ pub(crate) fn pattern_from(command: &str) -> Option<String> {
 ///
 /// ⚠️ Ignoring this answers a DIFFERENT question than the one asked. Observed
 /// live: `grep -rn "AppState" formsvc/src/` was answered from the whole
-/// 18-repo index, so bm25 surfaced a different project's `AppState` and the
+/// multi-repo index, so bm25 surfaced a different project's `AppState` and the
 /// top-25 cap meant the searched directory barely appeared. The caller had
 /// already said where to look; not using it is both less accurate and more work.
 pub(crate) fn paths_from(command: &str) -> Vec<String> {
@@ -660,7 +660,7 @@ async fn indexed_repo_paths(pool: &sqlx::SqlitePool) -> Option<Vec<String>> {
 ///
 /// ⚠️ THE DEFECT THIS EXISTS FOR. "First candidate with content" stops an EMPTY
 /// database shadowing a real one, but not a WRONG one. Observed live: a search
-/// in an 18-repo work tree was answered from a database indexing an unrelated
+/// in a large work tree was answered from a database indexing an unrelated
 /// personal project — returning that project's `AppState`, with provenance, and
 /// a confident "index current". Well-formed, well-labelled, wrong codebase.
 ///
@@ -824,7 +824,7 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
 
 /// Group hits by directory and render the caller-facing text.
 ///
-/// Grouping is the whole value: measured on an 18-repo corpus, grep returns
+/// Grouping is the whole value: measured on a large workspace, grep returns
 /// 3,611 lines conflating 121 distinct locations while a typical location holds
 /// 16. Naming the location is the gain, and it needs no parser — only the path
 /// nibdex already stores per chunk.
@@ -1202,7 +1202,7 @@ pub async fn run() -> ! {
     // OVER-FETCH WHEN SCOPED. Filtering after the limit is backwards: the
     // globally top-ranked N may contain none of the caller's directory, so the
     // narrower — and more correct — their scope, the likelier the answer is
-    // empty. Observed live: `grep AppState formsvc/src/` on an 18-repo index
+    // empty. Observed live: `grep AppState formsvc/src/` on a large index
     // returned nothing, because the top 25 for that term were all other repos.
     let fetch = if scope.is_empty() { MAX_HITS } else { MAX_HITS * 40 };
     // Constrain to the repo the caller is actually standing in. The path scope
@@ -1309,7 +1309,7 @@ mod tests {
     /// this whole design exists to avoid.
     /// The caller's path arguments ARE the scope, and ignoring them answers a
     /// different question. Live failure: `grep -rn "AppState" formsvc/src/`
-    /// was answered from an entire 18-repo index, so another project's matches
+    /// was answered from an entire multi-repo index, so another project's matches
     /// outranked the searched directory and the cap hid it almost entirely.
     #[test]
     fn path_arguments_are_extracted_as_scope() {

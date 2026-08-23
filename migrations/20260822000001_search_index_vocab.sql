@@ -1,0 +1,15 @@
+-- SPDX-License-Identifier: MIT
+--
+-- QUERY_QUALITY_DESIGN §4.2: hand back the vocabulary the caller structurally lacks.
+--
+-- `fts5vocab` is a virtual table over an existing FTS5 index: it stores NOTHING of
+-- its own and is always exactly as current as `search_index`, because it reads the
+-- same b-tree. `'row'` mode gives one row per distinct term with `doc` = the number
+-- of indexed rows containing it — i.e. corpus document frequency, which is the
+-- denominator of any tf-idf and the one number a caller cannot compute.
+--
+-- Why permanent rather than transient: `thread_metric::sample_terms` creates and
+-- drops `vocab_si` per run, which is correct for an offline measurement but is DDL
+-- on the query path if copied there. A query serving a live MCP call must not
+-- create tables. Costs nothing to leave in place.
+CREATE VIRTUAL TABLE IF NOT EXISTS search_index_vocab USING fts5vocab('search_index', 'row');

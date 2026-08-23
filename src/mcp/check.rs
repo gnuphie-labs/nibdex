@@ -163,7 +163,7 @@ async fn read_file_watcher_stats(pool: &SqlitePool) -> Result<Option<FileWatcher
     }))
 }
 
-async fn compute_indexer_counts(pool: &SqlitePool) -> Result<IndexerCounts> {
+pub(crate) async fn compute_indexer_counts(pool: &SqlitePool) -> Result<IndexerCounts> {
     let doc_rows: Vec<(String, i64)> =
         sqlx::query_as("SELECT kind, COUNT(*) FROM documents GROUP BY kind ORDER BY kind")
             .fetch_all(pool)

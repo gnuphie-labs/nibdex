@@ -1008,7 +1008,17 @@ pub fn grep_line(hit: &CodeHit) -> String {
         LocationStatus::Stale => "  [stale: file changed since index]".to_string(),
         LocationStatus::FileMissing => "  [missing: file gone]".to_string(),
     };
-    format!("{}:{}:[{}] {}{}{}", hit.path, hit.match_line, lang, first, via, flag)
+    // gnuphie-labs#8: `path` is repo-RELATIVE, so emitting it alone hands the
+    // consumer a string that only resolves if they happen to be in the right
+    // directory — and on a multi-repo index several repos have a `src/main.rs`.
+    // Anchor it: a quickfix `%f` takes an absolute path happily, and an absolute
+    // path cannot resolve against the wrong repo. Falls back to the bare relative
+    // path only when the repo root is genuinely unknown.
+    let located = match &hit.repo_path {
+        Some(root) => format!("{}/{}", root.trim_end_matches('/'), hit.path),
+        None => hit.path.clone(),
+    };
+    format!("{}:{}:[{}] {}{}{}", located, hit.match_line, lang, first, via, flag)
 }
 
 #[cfg(test)]
@@ -1131,7 +1141,7 @@ mod tests {
         // Verified adds NO marker — the common (clean-tree) case stays noise-free.
         assert_eq!(
             grep_line(&hit),
-            "src/rescore.rs:45:[rust] fn compute() {}  (via 5de5a45a v0.2 honest savings)"
+            "/ws/proj/src/rescore.rs:45:[rust] fn compute() {}  (via 5de5a45a v0.2 honest savings)"
         );
     }
 
@@ -1154,13 +1164,18 @@ mod tests {
         // The marker rides in `%m` (after the 2nd colon) so `%f:%l` stays parseable.
         assert_eq!(
             grep_line(&hit),
-            "src/a.rs:7:[rust] fn x() {}  [stale: file changed since index]"
+            "/ws/proj/src/a.rs:7:[rust] fn x() {}  [stale: file changed since index]"
         );
         hit.location = LocationStatus::FileMissing;
-        assert_eq!(grep_line(&hit), "src/a.rs:7:[rust] fn x() {}  [missing: file gone]");
+        assert_eq!(grep_line(&hit), "/ws/proj/src/a.rs:7:[rust] fn x() {}  [missing: file gone]");
         // Relocated: the line numbers are already corrected; the marker just says so.
         hit.location = LocationStatus::Relocated;
         hit.line_shift = Some(30);
+        assert_eq!(grep_line(&hit), "/ws/proj/src/a.rs:7:[rust] fn x() {}  [moved +30]");
+
+        // gnuphie-labs#8: with no known repo root there is nothing to anchor to,
+        // so the bare relative path is the honest output rather than a guess.
+        hit.repo_path = None;
         assert_eq!(grep_line(&hit), "src/a.rs:7:[rust] fn x() {}  [moved +30]");
     }
 

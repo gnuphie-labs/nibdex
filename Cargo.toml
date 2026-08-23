@@ -1,6 +1,6 @@
 [package]
 name = "nibdex"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.4"
 edition = "2024"
 description = "nibdex — derived MCP index over a workspace's source code, git commits, design docs, memory, and AI session history"
 license = "MIT"
@@ -36,6 +36,7 @@ exclude = [
     "docs/reviews/",
     "dogfood/",
     "baselines/",
+    ".githooks/",
 ]
 
 [dependencies]
